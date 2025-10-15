@@ -2,3 +2,6 @@ flask==3.0.0
 gunicorn==21.2.0
 SQLAlchemy==2.0.37
 psycopg[binary]==3.2.10
+openai==1.40.0
+feedparser==6.0.11
+

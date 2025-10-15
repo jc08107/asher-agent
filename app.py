@@ -4,17 +4,22 @@ from sqlalchemy import create_engine, text
 
 app = Flask(__name__)
 
-# --- Build a safe DB URL (Render Postgres expects SSL) ---
-raw_url = os.environ.get("DATABASE_URL", "")
-if raw_url and "sslmode=" not in raw_url:
-    if "?" in raw_url:
-        db_url = raw_url + "&sslmode=require"
-    else:
-        db_url = raw_url + "?sslmode=require"
-else:
-    db_url = raw_url
+# --- Build a safe DB URL for psycopg v3 + SSL on Render ---
+raw_url = os.environ.get("DATABASE_URL", "") or ""
 
-engine = create_engine(db_url, pool_pre_ping=True)
+# Convert legacy schemes to SQLAlchemy's psycopg v3 dialect
+# e.g., postgres://...  or postgresql://...  --> postgresql+psycopg://...
+if raw_url.startswith("postgres://"):
+    raw_url = "postgresql+psycopg://" + raw_url[len("postgres://"):]
+elif raw_url.startswith("postgresql://"):
+    raw_url = "postgresql+psycopg://" + raw_url[len("postgresql://"):]
+
+# Ensure SSL is required (Render Postgres expects SSL)
+if raw_url:
+    if "sslmode=" not in raw_url:
+        raw_url = raw_url + ("&" if "?" in raw_url else "?") + "sslmode=require"
+
+engine = create_engine(raw_url, pool_pre_ping=True)
 
 # --- Simple endpoints ---
 

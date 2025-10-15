@@ -1,6 +1,12 @@
 import os
 from flask import Flask, jsonify
 from sqlalchemy import create_engine, text
+import feedparser
+from flask import request
+from openai import OpenAI
+
+client = OpenAI()  # uses OPENAI_API_KEY from env
+
 
 app = Flask(__name__)
 
@@ -85,6 +91,122 @@ def count():
     with engine.connect() as conn:
         n = conn.execute(text("SELECT COUNT(*) FROM leads")).scalar()
     return jsonify({"ok": True, "lead_count": n}), 200
+
+def classify_intent(text: str) -> dict:
+    """
+    Ask GPT to label text as BUY_READY / CURIOUS / OFF_TOPIC.
+    Returns dict like {"label": "...", "confidence": 0.0}
+    """
+    prompt = f"""
+    You label a short book-related post as one of:
+    - BUY_READY: actively asking for the next book now
+    - CURIOUS: general interest, not clearly ready to buy now
+    - OFF_TOPIC: not about finding a book
+
+    Post:
+    {text}
+
+    Reply as JSON with keys: label, confidence (0-1), rationale.
+    """
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role":"system","content":"You are a concise intent classifier for book discovery."},
+            {"role":"user","content": prompt}
+        ],
+        temperature=0.1,
+    )
+    raw = resp.choices[0].message.content.strip()
+    # very simple parser: try to find label text; if JSON, great; if not, fall back
+    import json, re
+    try:
+        data = json.loads(raw)
+        label = data.get("label","OFF_TOPIC").strip().upper()
+        conf = float(data.get("confidence", 0.5))
+    except Exception:
+        # fallback: look for BUY_READY etc.
+        m = re.search(r"(BUY_READY|CURIOUS|OFF_TOPIC)", raw, re.I)
+        label = (m.group(1).upper() if m else "OFF_TOPIC")
+        conf = 0.5
+    return {"label": label, "confidence": conf}
+    
+
+@app.post("/classify-insert")
+def classify_insert():
+    """
+    POST JSON: { "text": "...", "platform": "rss", "url": "https://..", "author": "..." }
+    → classify with GPT → insert into leads (always insert; you can filter client-side)
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    text_body = (data.get("text") or "").strip()
+    if not text_body:
+        return {"ok": False, "error": "Missing 'text' in JSON body"}, 400
+
+    result = classify_intent(text_body)
+    label = result["label"]
+
+    sql = """
+    INSERT INTO leads (platform, source_url, author, post_text, intent)
+    VALUES (:platform, :source_url, :author, :post_text, :intent)
+    RETURNING id;
+    """
+    params = {
+        "platform": data.get("platform") or "unknown",
+        "source_url": data.get("url") or "n/a",
+        "author": data.get("author") or "n/a",
+        "post_text": text_body,
+        "intent": label
+    }
+    with engine.begin() as conn:
+        new_id = conn.execute(text(sql), params).scalar()
+    return {"ok": True, "inserted_id": new_id, "label": label, "model_raw": result}, 200
+
+
+@app.post("/ingest/rss")
+def ingest_rss():
+    """
+    POST JSON: { "feed": "https://..." }
+    Pull an RSS feed, classify each entry, insert rows.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    feed_url = body.get("feed")
+    if not feed_url:
+        return {"ok": False, "error": "Provide 'feed' URL in JSON"}, 400
+
+    feed = feedparser.parse(feed_url)
+    if not feed.entries:
+        return {"ok": False, "feed": feed_url, "inserted": 0, "error": "No entries found"}, 200
+
+    inserted = 0
+    for e in feed.entries[:20]:  # limit for now
+        url = getattr(e, "link", "n/a")
+        author = getattr(e, "author", "n/a")
+        title = getattr(e, "title", "")
+        summary = getattr(e, "summary", "")
+        text_body = (title + "\n\n" + summary).strip()
+
+        # classify with GPT
+        result = classify_intent(text_body)
+        label = result["label"]
+
+        # insert into leads table
+        sql = """
+        INSERT INTO leads (platform, source_url, author, post_text, intent)
+        VALUES (:platform, :source_url, :author, :post_text, :intent)
+        """
+        params = {
+            "platform": "rss",
+            "source_url": url,
+            "author": author,
+            "post_text": text_body[:5000],  # safety slice
+            "intent": label
+        }
+        with engine.begin() as conn:
+            conn.execute(text(sql), params)
+        inserted += 1
+
+    return {"ok": True, "feed": feed_url, "inserted": inserted}, 200
+
 
 
 # Make the root friendly

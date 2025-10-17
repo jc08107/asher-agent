@@ -119,6 +119,13 @@ def migrate_add_explanations():
         conn.execute(text(ddl))
     return {"ok": True, "message": "Column explanations ready"}, 200
 
+@app.post("/migrate/add-notion-page-id")
+def migrate_add_notion_page_id():
+    ddl = "ALTER TABLE leads ADD COLUMN IF NOT EXISTS notion_page_id TEXT;"
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
+    return {"ok": True, "message": "Column notion_page_id ready"}, 200
+
 # -----------------------------
 # Insert test row
 # -----------------------------

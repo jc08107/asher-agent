@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import urllib.parse
 import feedparser
 from datetime import datetime, timezone
 from flask import Flask, jsonify, request
@@ -121,7 +122,7 @@ BOOKS = {
             "that unites their people is worth preserving."
         ),
         "content_notes": ["romance (queer), peril, political stakes"],
-        "sample_link": "https://a.co/d/4GKJm8Q"  # TODO: replace with your real link
+        "sample_link": "https://a.co/d/4GKJm8Q"
     },
     # "JINGLED": { ... }  # add later when you're ready
 }
@@ -615,6 +616,176 @@ def analyze_endpoint():
     result = analyze_topics_and_fit(post_text, book)
     return jsonify({"ok": True, **result}), 200
 
+# ============================================================
+# NEW: Reddit comb (RSS-based, no API keys) — /ingest/reddit_rss
+# ============================================================
+def _bool_arg(val: str | None, default: bool) -> bool:
+    if val is None:
+        return default
+    return str(val).lower() in ("1", "true", "yes", "on")
+
+@app.route("/ingest/reddit_rss", methods=["GET", "POST"])
+def ingest_reddit_rss():
+    """
+    Discover candidate posts on Reddit via RSS (no auth).
+    GET query params (or POST JSON):
+      sub: comma-separated subreddits (e.g., 'books,YAlit')  [required]
+      q:   search query (URL-encoded automatically)           [required]
+      sort: 'new' or 'relevance' (default: 'new')
+      limit: per-subreddit item cap (default: 10)
+      autodraft: 0/1 to force-disable/enable draft writes (default behavior:
+                  only auto-draft BUY_READY & fit>=0.60 or NOTION_AUTODRAFT=1)
+
+    Returns: { ok, total_inserted, per_sub: {sub: n}, samples: [ids...] }
+    """
+    if request.method == "POST":
+        body = request.get_json(force=True, silent=True) or {}
+        subs = body.get("sub") or body.get("subs") or ""
+        q = body.get("q") or ""
+        sort = (body.get("sort") or "new").lower()
+        limit = int(body.get("limit") or 10)
+        autodraft_override = body.get("autodraft")
+    else:
+        subs = request.args.get("sub", "")
+        q = request.args.get("q", "")
+        sort = (request.args.get("sort") or "new").lower()
+        limit = int(request.args.get("limit") or 10)
+        autodraft_override = request.args.get("autodraft")
+
+    subs_list = [s.strip() for s in subs.split(",") if s.strip()]
+    if not subs_list or not q:
+        return {
+            "ok": False,
+            "error": "Provide both 'sub' (comma list) and 'q' (query)."
+        }, 400
+    sort = "new" if sort not in ("new", "relevance") else sort
+
+    # Determine auto-draft policy for THIS run
+    # Default mirrors your existing logic unless autodraft=0 explicitly disables it.
+    force_autodraft_off = (_bool_arg(str(autodraft_override), False) is True and str(autodraft_override).strip() in ("0", "false", "no"))
+    # detect explicit on
+    force_autodraft_on = (_bool_arg(str(autodraft_override), False) is True and str(autodraft_override).strip() in ("1", "true", "yes"))
+
+    per_sub_counts = {}
+    inserted_ids = []
+    total = 0
+    book = BOOKS.get(ACTIVE_BOOK, BOOKS["ASHER"])
+
+    for sub in subs_list:
+        # Build RSS search URL:
+        # https://www.reddit.com/r/<sub>/search.rss?q=<query>&restrict_sr=1&sort=<sort>
+        q_enc = urllib.parse.quote_plus(q)
+        rss_url = f"https://www.reddit.com/r/{sub}/search.rss?q={q_enc}&restrict_sr=1&sort={sort}"
+        feed = feedparser.parse(rss_url)
+
+        count_for_sub = 0
+        for e in feed.entries[:limit]:
+            url = getattr(e, "link", "")
+            if not url:
+                continue
+
+            # optional: skip duplicates by URL
+            with engine.connect() as conn:
+                exists = conn.execute(text("SELECT 1 FROM leads WHERE source_url=:u LIMIT 1"), {"u": url}).first()
+            if exists:
+                continue
+
+            author = getattr(e, "author", "reddit_user")
+            title = getattr(e, "title", "") or ""
+            summary = getattr(e, "summary", "") or ""
+            # some RSS summaries contain HTML; keep it simple
+            text_body = (title.strip() + "\n\n" + re.sub(r"<[^>]+>", "", summary)).strip()
+
+            # classify intent
+            result = classify_intent(text_body)
+            label = result["label"]
+
+            # topics + fit
+            topicfit = analyze_topics_and_fit(text_body, book)
+            topics_csv = ", ".join(topicfit["topics"]) if topicfit["topics"] else None
+            fit_val = float(topicfit["fit_score"])
+            explain = topicfit.get("explanations") or None
+
+            # insert
+            sql = """
+            INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score, explanations, status)
+            VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score, :explanations, :status)
+            RETURNING id;
+            """
+            params = {
+                "platform": "reddit",
+                "source_url": url,
+                "author": author,
+                "post_text": text_body[:5000],
+                "intent": label,
+                "topics": topics_csv,
+                "fit_score": fit_val,
+                "explanations": explain,
+                "status": "new"
+            }
+            with engine.begin() as conn:
+                new_id = conn.execute(text(sql), params).scalar()
+
+            # Decide whether to auto-generate a draft now for this run
+            auto_draft_default = (label == "BUY_READY" and fit_val >= 0.60) or (os.getenv("NOTION_AUTODRAFT","0") == "1")
+            auto_draft = auto_draft_default
+            if force_autodraft_off:
+                auto_draft = False
+            elif force_autodraft_on:
+                auto_draft = True
+
+            draft_text = None
+            if auto_draft:
+                draft_text = generate_reply_text({
+                    "post_text": text_body,
+                    "intent": label,
+                    "topics": topicfit["topics"],
+                    "fit_score": fit_val
+                })
+                with engine.begin() as conn:
+                    conn.execute(
+                        text("UPDATE leads SET reply_text=:r WHERE id=:i"),
+                        {"r": draft_text, "i": new_id}
+                    )
+
+            # Notion sync
+            draft_link = url_for_service(request, f"/notion/fill-draft?id={new_id}&force=1")
+            send_link  = url_for_service(request, f"/send?id={new_id}")
+
+            lead_for_notion = {
+                "id": new_id,
+                "post_text": text_body,
+                "intent": label,
+                "fit_score": fit_val,
+                "topics": topicfit["topics"],
+                "source_link": url,
+                "draft_link": draft_link,
+                "send_link": send_link,
+            }
+            try:
+                page_id = create_notion_row(lead_for_notion, draft_text=draft_text)
+            except Exception:
+                page_id = None
+            if page_id:
+                with engine.begin() as conn:
+                    conn.execute(text("UPDATE leads SET notion_page_id=:pid WHERE id=:id"),
+                                 {"pid": page_id, "id": new_id})
+
+            count_for_sub += 1
+            total += 1
+            inserted_ids.append(new_id)
+
+        per_sub_counts[sub] = count_for_sub
+
+    return {
+        "ok": True,
+        "query": q,
+        "subs": subs_list,
+        "per_sub": per_sub_counts,
+        "total_inserted": total,
+        "samples": inserted_ids[:10]
+    }, 200
+
 # -----------------------------
 # ingest/rss: pull, label + topics + fit for each entry
 # -----------------------------
@@ -854,13 +1025,8 @@ def _reddit_reply(source_url: str, reply_text: str) -> dict:
         user_agent=os.getenv("REDDIT_USER_AGENT", "asher-agent/1.0"),
     )
 
-    # Detect whether URL points to a submission or a comment
-    # Examples:
-    #  - https://www.reddit.com/r/books/comments/abc123/title_slug/
-    #  - https://www.reddit.com/r/books/comments/abc123/title_slug/def456/?context=3  (comment)
     m = re.search(r"/comments/([a-z0-9]+)/[^/]+(?:/([a-z0-9]+))?", source_url, re.I)
     if not m:
-        # Fallback: let PRAW parse anyway
         try:
             thing = reddit.comment(url=source_url)
             posted = thing.reply(reply_text)
@@ -881,7 +1047,7 @@ def _reddit_reply(source_url: str, reply_text: str) -> dict:
     return {"permalink": f"https://www.reddit.com{posted.permalink}", "id": posted.id}
 
 # -----------------------------
-# Send (now uses platform adapters; still safe by default)
+# Send (still safe by default)
 # -----------------------------
 @app.get("/send")
 def send_route():
@@ -922,7 +1088,6 @@ def send_route():
         except Exception as e:
             return jsonify({"ok": False, "error": f"Reddit send failed: {e}"}), 500
     else:
-        # Unsupported or disallowed platform → no-op (still mark Posted to keep the flow)
         pass
 
     sent_at = datetime.now(timezone.utc)
@@ -932,13 +1097,10 @@ def send_route():
             {"t": sent_at, "r": sent_ref, "i": row["id"]}
         )
 
-    # Reflect to Notion if we have a page
     if row["notion_page_id"]:
         props = {
             "Status": notion_prop("select", {"name": "Posted"}),
         }
-        # Optional: add a "Permalink" URL property in Notion and set it here
-        # Make sure your Notion DB has a URL column named exactly "Permalink"
         if permalink:
             props["Permalink"] = notion_prop("url", permalink)
         try:

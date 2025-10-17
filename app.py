@@ -495,6 +495,42 @@ def classify_insert():
         "notion_page_id": page_id
     }, 200
 
+@app.get("/notion/diag")
+def notion_diag():
+    import traceback
+    info = {"env_seen": bool(notion), "db_id": os.getenv("NOTION_DB_ID", "")[:8] + "..."}
+    if not notion:
+        info["error"] = "Notion client not initialized. Check NOTION_TOKEN and NOTION_DB_ID."
+        return info, 200
+    try:
+        # 1) Can we read the database?
+        db = notion.databases.retrieve(database_id=NOTION_DB_ID)
+        info["db_ok"] = True
+        info["db_title"] = db.get("title", [{}])[0].get("plain_text", "")
+        props = list(db.get("properties", {}).keys())
+        info["props"] = props[:20]
+
+        # 2) Try a harmless dry-run create with only the Title prop
+        #    Code expects the title prop to be named "Post (snippet)"
+        if "Post (snippet)" not in props:
+            return {**info, "error": 'Missing required Notion property: "Post (snippet)". Rename your title column to exactly that.'}, 200
+
+        page = notion.pages.create(
+            parent={"database_id": NOTION_DB_ID},
+            properties={"Post (snippet)": {"title": [{"type": "text","text": {"content": "[diag] connectivity test"}}]}}
+        )
+        # immediately archive the test page to keep the DB clean
+        notion.pages.update(page_id=page["id"], archived=True)
+        info["create_ok"] = True
+        return info, 200
+
+    except Exception as e:
+        return {
+            **info,
+            "error": f"{type(e).__name__}: {e}",
+            "trace": traceback.format_exc()[:2000]
+        }, 200
+
 # -----------------------------
 # Optional: quick analyzer endpoint for ad-hoc tests
 # -----------------------------

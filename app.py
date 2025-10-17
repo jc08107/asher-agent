@@ -475,7 +475,7 @@ def analyze_endpoint():
     return jsonify({"ok": True, **result}), 200
 
 # ============================================================
-# Reddit comb (RSS-based) + Presets
+# Reddit comb (RSS-based) + Presets (with fallback + fuzzy match)
 # ============================================================
 def _bool_arg(val: str | None, default: bool) -> bool:
     if val is None: return default
@@ -484,6 +484,54 @@ def _bool_arg(val: str | None, default: bool) -> bool:
 def _sub_from_url(url: str) -> str | None:
     m = re.search(r"reddit\.com/r/([^/]+)/", url, re.I)
     return m.group(1) if m else None
+
+import html
+import urllib.parse
+
+def _fetch_reddit_rss(url: str):
+    # Use a real UA; Reddit may return empties/429 without it.
+    return feedparser.parse(url, request_headers={
+        "User-Agent": os.getenv("REDDIT_USER_AGENT", "asher-agent/1.0 (+https://render.com)")
+    })
+
+def _strip_html(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", html.unescape(s or ""))
+
+def _tokenize_query(q: str):
+    """
+    Returns (pos_groups, neg_terms). Supports:
+      - OR groups: "queer fantasy OR lgbt fantasy"
+      - minus terms: -megathread -weekly
+      - quoted phrases: "royal romance"
+    Any one OR-group hit qualifies; minus kills a match.
+    """
+    q = q.strip()
+    neg = [t[1:].lower() for t in re.findall(r"\-\w[\w\-]+", q)]
+    or_chunks = re.split(r"\s+OR\s+", q, flags=re.IGNORECASE)
+    groups = []
+    for chunk in or_chunks:
+        phrases = [m.strip('"').lower() for m in re.findall(r'"([^"]+)"', chunk)]
+        chunk_no_quotes = re.sub(r'"[^"]+"', " ", chunk)
+        chunk_no_quotes = re.sub(r"\-\w[\w\-]+", " ", chunk_no_quotes)
+        words = [w.lower() for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]+", chunk_no_quotes)]
+        terms = [t for t in (phrases + words) if t]
+        if terms:
+            groups.append(terms)
+    return groups, neg
+
+def _fuzzy_match(text: str, pos_groups, neg_terms) -> bool:
+    """
+    True if:
+      - none of neg_terms appear, and
+      - at least one positive group has ≥1 hit (phrase or word).
+    """
+    t = text.lower()
+    if any(n in t for n in neg_terms):
+        return False
+    for group in pos_groups:
+        if any(term in t for term in group):
+            return True
+    return False
 
 @app.route("/ingest/reddit_rss", methods=["GET", "POST"])
 def ingest_reddit_rss():
@@ -517,25 +565,52 @@ def ingest_reddit_rss():
     for sub in subs_list:
         q_enc = urllib.parse.quote_plus(q)
         rss_url = f"https://www.reddit.com/r/{sub}/search.rss?q={q_enc}&restrict_sr=1&sort={sort}"
-        feed = feedparser.parse(rss_url)
+        feed = _fetch_reddit_rss(rss_url)
 
         count_for_sub = 0
-        for e in feed.entries[:limit]:
+
+        # Fallback plan:
+        # 1) Start with search RSS entries.
+        # 2) If none, pull /new RSS and fuzzy-filter locally.
+        entries = feed.entries[:limit]
+        using_fallback = False
+        if not entries:
+            new_url = f"https://www.reddit.com/r/{sub}/new/.rss"
+            new_feed = _fetch_reddit_rss(new_url)
+            # scan a bit more in fallback, then filter
+            entries = new_feed.entries[: max(limit, 20)]
+            using_fallback = True
+
+        # Precompute fuzzy tokens once (used only if using_fallback)
+        pos_groups, neg_terms = _tokenize_query(q)
+
+        for e in entries:
             url = getattr(e, "link", "")
-            if not url: continue
+            if not url:
+                continue
 
             # skip duplicates
             with engine.connect() as conn:
                 exists = conn.execute(text("SELECT 1 FROM leads WHERE source_url=:u LIMIT 1"), {"u": url}).first()
-            if exists: continue
+            if exists:
+                continue
 
             author = getattr(e, "author", "reddit_user")
             title = getattr(e, "title", "") or ""
-            summary = getattr(e, "summary", "") or ""
-            text_body = (title.strip() + "\n\n" + re.sub(r"<[^>]+>", "", summary)).strip()
+            summary_raw = getattr(e, "summary", "") or ""
+            summary = _strip_html(summary_raw)
+            text_body = (title.strip() + "\n\n" + summary).strip()
 
+            # If we're in fallback mode, require fuzzy match; otherwise accept.
+            if using_fallback:
+                if not _fuzzy_match(text_body, pos_groups, neg_terms):
+                    continue
+
+            # classify
             result = classify_intent(text_body)
             label = result["label"]
+
+            # topics + fit
             topicfit = analyze_topics_and_fit(text_body, book)
             topics_csv = ", ".join(topicfit["topics"]) if topicfit["topics"] else None
             fit_val = float(topicfit["fit_score"])

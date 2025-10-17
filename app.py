@@ -183,7 +183,8 @@ def init():
         -- new optional columns used by /notion/fill-draft and /send
         reply_text TEXT,
         status TEXT,
-        sent_at TIMESTAMPTZ
+        sent_at TIMESTAMPTZ,
+        sent_ref TEXT
     );
     """
     with engine.begin() as conn:
@@ -222,6 +223,15 @@ def migrate_add_send_cols():
         conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS status TEXT;"))
         conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;"))
     return {"ok": True, "message": "Columns reply_text, status, sent_at ready"}, 200
+
+# -----------------------------
+# NEW Migration (adds sent_ref) — step 3
+# -----------------------------
+@app.route("/migrate/add-sent-ref", methods=["GET", "POST"])
+def migrate_add_sent_ref():
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS sent_ref TEXT;"))
+    return {"ok": True, "message": "Column sent_ref ready"}, 200
 
 # -----------------------------
 # Insert test row
@@ -418,7 +428,7 @@ def generate_reply_text(row_like: dict) -> str:
     profile_note = (
         f"You're replying as the author of '{book['title']}'. "
         f"Audience: {book['audience']}. Genres: {', '.join(book['genres'])}. "
-        f"Tropes: {', '.join(book['tropes'])}. Tone: {book['tone']}. "
+        f"Tropes: {book['tropes']}. Tone: {book['tone']}. "
         f"Pitch: {book['short_pitch']}. Sample link: {book['sample_link']}"
     )
 
@@ -679,9 +689,6 @@ def ingest_rss():
                 )
 
         draft_link = url_for_service(request, f"/notion/fill-draft?id={new_id}&force=1")
-        # (fix accidental brace if any)
-        if draft_link.endswith("}"):
-            draft_link = draft_link[:-1]
         send_link  = url_for_service(request, f"/send?id={new_id}")
 
         lead_for_notion = {
@@ -744,7 +751,7 @@ def reply_draft():
     return {"ok": True, "id": int(row["id"]), "reply": reply}, 200
 
 # -----------------------------
-# NEW: Notion fill-draft (clickable from Notion)
+# Notion fill-draft (clickable from Notion)
 # -----------------------------
 @app.get("/notion/fill-draft")
 def notion_fill_draft():
@@ -814,14 +821,74 @@ def notion_fill_draft():
     }), 200
 
 # -----------------------------
-# NEW: Send shim (no external posting yet)
+# Send helpers (feature-flagged live posting)
+# -----------------------------
+def _is_live() -> bool:
+    return os.getenv("SEND_LIVE", "0") == "1"
+
+def _send_allowed(platform: str) -> bool:
+    allow = (os.getenv("SEND_PLATFORMS", "reddit").split(","))
+    allow = [a.strip().lower() for a in allow if a.strip()]
+    return platform.lower() in allow
+
+def _reddit_reply(source_url: str, reply_text: str) -> dict:
+    """
+    Reply in-place on Reddit under source_url (submission or comment).
+    Returns {"permalink": "...", "id": "..."}.
+    Requires PRAW env vars and SEND_LIVE=1 to actually post.
+    In dry-run, returns {"permalink": None, "id": None}.
+    """
+    if not _is_live():
+        return {"permalink": None, "id": None}
+
+    try:
+        import praw
+    except Exception as e:
+        raise RuntimeError("praw is not installed. Add 'praw==7.8.1' to requirements.txt.") from e
+
+    reddit = praw.Reddit(
+        client_id=os.getenv("REDDIT_CLIENT_ID"),
+        client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
+        username=os.getenv("REDDIT_USERNAME"),
+        password=os.getenv("REDDIT_PASSWORD"),
+        user_agent=os.getenv("REDDIT_USER_AGENT", "asher-agent/1.0"),
+    )
+
+    # Detect whether URL points to a submission or a comment
+    # Examples:
+    #  - https://www.reddit.com/r/books/comments/abc123/title_slug/
+    #  - https://www.reddit.com/r/books/comments/abc123/title_slug/def456/?context=3  (comment)
+    m = re.search(r"/comments/([a-z0-9]+)/[^/]+(?:/([a-z0-9]+))?", source_url, re.I)
+    if not m:
+        # Fallback: let PRAW parse anyway
+        try:
+            thing = reddit.comment(url=source_url)
+            posted = thing.reply(reply_text)
+            return {"permalink": f"https://www.reddit.com{posted.permalink}", "id": posted.id}
+        except Exception:
+            thing = reddit.submission(url=source_url)
+            posted = thing.reply(reply_text)
+            return {"permalink": f"https://www.reddit.com{posted.permalink}", "id": posted.id}
+
+    sub_id, comment_id = m.group(1), m.group(2)
+    if comment_id:
+        parent = reddit.comment(comment_id)
+        posted = parent.reply(reply_text)
+    else:
+        parent = reddit.submission(submission_id=sub_id)
+        posted = parent.reply(reply_text)
+
+    return {"permalink": f"https://www.reddit.com{posted.permalink}", "id": posted.id}
+
+# -----------------------------
+# Send (now uses platform adapters; still safe by default)
 # -----------------------------
 @app.get("/send")
 def send_route():
     """
     GET /send?id=LEAD_ID
-    For now, this marks the lead as 'posted', stamps sent_at, and mirrors Status in Notion.
-    Replace the no-op section with platform adapters to truly publish.
+    - If SEND_LIVE=0 (default), does NOT publish; marks Posted for flow testing.
+    - If SEND_LIVE=1 and platform allowed, publishes and writes Permalink + sent_ref.
     """
     lead_id = request.args.get("id", type=int)
     if not lead_id:
@@ -837,33 +904,56 @@ def send_route():
 
     if not row:
         return jsonify({"ok": False, "error": "Lead not found"}), 404
-
     if not row["reply_text"] or not row["reply_text"].strip():
         return jsonify({"ok": False, "error": "No draft exists. Use /notion/fill-draft first."}), 400
 
-    # Placeholder: Do NOT actually post externally yet.
+    platform = (row["platform"] or "").lower()
+    source_url = row["source_url"] or ""
+    draft_text = row["reply_text"].strip()
+
+    permalink = None
+    sent_ref = None
+
+    if _send_allowed(platform) and platform == "reddit":
+        try:
+            res = _reddit_reply(source_url, draft_text)
+            permalink = res.get("permalink")
+            sent_ref = res.get("id")
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"Reddit send failed: {e}"}), 500
+    else:
+        # Unsupported or disallowed platform → no-op (still mark Posted to keep the flow)
+        pass
+
     sent_at = datetime.now(timezone.utc)
     with engine.begin() as conn:
         conn.execute(
-            text("UPDATE leads SET status='posted', sent_at=:t WHERE id=:i"),
-            {"t": sent_at, "i": row["id"]}
+            text("UPDATE leads SET status='posted', sent_at=:t, sent_ref=:r WHERE id=:i"),
+            {"t": sent_at, "r": sent_ref, "i": row["id"]}
         )
 
+    # Reflect to Notion if we have a page
     if row["notion_page_id"]:
+        props = {
+            "Status": notion_prop("select", {"name": "Posted"}),
+        }
+        # Optional: add a "Permalink" URL property in Notion and set it here
+        # Make sure your Notion DB has a URL column named exactly "Permalink"
+        if permalink:
+            props["Permalink"] = notion_prop("url", permalink)
         try:
-            update_notion_fields(row["notion_page_id"], {
-                "Status": notion_prop("select", {"name": "Posted"}),
-                # Add a 'Permalink' URL property here once real adapters return it.
-            })
+            update_notion_fields(row["notion_page_id"], props)
         except Exception:
             pass
 
     return jsonify({
         "ok": True,
         "lead_id": int(row["id"]),
-        "platform": row["platform"],
-        "source_url": row["source_url"],
-        "sent_at": sent_at.isoformat()
+        "platform": platform,
+        "source_url": source_url,
+        "permalink": permalink,
+        "sent_at": sent_at.isoformat(),
+        "live": _is_live()
     }), 200
 
 # -----------------------------

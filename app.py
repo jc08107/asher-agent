@@ -7,10 +7,64 @@ from flask import Flask, jsonify, request
 from sqlalchemy import create_engine, text
 from openai import OpenAI
 
+# Notion
+from notion_client import Client as NotionClient
+
 # -----------------------------
 # OpenAI client (reads OPENAI_API_KEY from env)
 # -----------------------------
 client = OpenAI()
+
+# -----------------------------
+# Notion client + env
+# -----------------------------
+NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
+NOTION_DB_ID = os.getenv("NOTION_DB_ID", "")
+notion = NotionClient(auth=NOTION_TOKEN) if (NOTION_TOKEN and NOTION_DB_ID) else None
+
+def _ms_text(s: str):
+    return [{"type": "text", "text": {"content": (s or "")[:2000]}}]
+
+def create_notion_row(lead: dict, draft_text: str | None = None) -> str | None:
+    """
+    Create a Notion page for a lead. Returns page_id or None if Notion is not configured.
+    lead expects:
+      id, post_text, intent, fit_score, topics(list[str]), source_link, draft_link
+    """
+    if not notion:
+        return None
+
+    # Map topics to Notion multi_select
+    topics = [{"name": t} for t in (lead.get("topics") or []) if t]
+
+    props = {
+        "Post (snippet)": {"title": _ms_text((lead.get("post_text") or "")[:85])},
+        "Intent":        {"select": {"name": lead.get("intent") or "CURIOUS"}},
+        "Fit":           {"number": float(lead.get("fit_score") or 0.0)},
+        "Topics":        {"multi_select": topics},
+        "Source Link":   {"url": lead.get("source_link") or None},
+        "Draft Link":    {"url": lead.get("draft_link") or None},
+        "Status":        {"select": {"name": "New"}},
+        "Lead ID":       {"number": int(lead["id"]) if lead.get("id") is not None else None},
+    }
+
+    if draft_text:
+        props["Draft"] = {"rich_text": _ms_text(draft_text)}
+
+    page = notion.pages.create(
+        parent={"database_id": NOTION_DB_ID},
+        properties=props
+    )
+    return page.get("id")
+
+def update_notion_draft(page_id: str, draft_text: str):
+    """Update an existing Notion page's Draft field."""
+    if not notion or not page_id:
+        return
+    notion.pages.update(
+        page_id=page_id,
+        properties={"Draft": {"rich_text": _ms_text(draft_text[:2000])}}
+    )
 
 app = Flask(__name__)
 
@@ -66,18 +120,17 @@ def health():
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        return jsonify({"ok": True, "db": "connected"}), 200
+        return jsonify({"ok": True, "db": "connected", "notion": bool(notion)}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 # -----------------------------
-# Init (creates base table incl. explanations)
+# Init (creates base table incl. explanations + notion_page_id)
 # -----------------------------
 @app.post("/init")
 def init():
     """
-    Create a simple table for leads our agent will store.
-    You call this once after deploy.
+    Create the leads table (idempotent).
     """
     ddl = """
     CREATE TABLE IF NOT EXISTS leads (
@@ -90,6 +143,7 @@ def init():
         topics TEXT,                      -- comma-separated tags (optional)
         fit_score DOUBLE PRECISION,       -- 0.0 - 1.0 (optional)
         explanations TEXT,                -- why the fit was scored that way (debug)
+        notion_page_id TEXT,              -- Notion page id for sync
         created_at TIMESTAMPTZ DEFAULT NOW()
     );
     """
@@ -119,12 +173,7 @@ def migrate_add_explanations():
         conn.execute(text(ddl))
     return {"ok": True, "message": "Column explanations ready"}, 200
 
-@app.post("/migrate/add-notion-page-id")
-def migrate_add_notion_page_id():
-    ddl = "ALTER TABLE leads ADD COLUMN IF NOT EXISTS notion_page_id TEXT;"
-    with engine.begin() as conn:
-        conn.execute(text(ddl))
-    return {"ok": True, "message": "Column notion_page_id ready"}, 200
+# (Removed the temporary /migrate/add-notion-page-id route per instructions)
 
 # -----------------------------
 # Insert test row
@@ -310,13 +359,59 @@ def analyze_topics_and_fit(text_body: str, book_profile: dict) -> dict:
     }
 
 # -----------------------------
-# classify-insert: label + topics + fit (+ explanations), then insert
+# Helper: generate reply text (used by /reply-draft and optional auto-draft)
+# -----------------------------
+def generate_reply_text(row_like: dict) -> str:
+    """
+    row_like must have: post_text, intent, topics, fit_score
+    Uses ACTIVE_BOOK profile to produce a short reply.
+    """
+    book = BOOKS.get(ACTIVE_BOOK, BOOKS["ASHER"])
+    profile_note = (
+        f"You're replying as the author of '{book['title']}'. "
+        f"Audience: {book['audience']}. Genres: {', '.join(book['genres'])}. "
+        f"Tropes: {', '.join(book['tropes'])}. Tone: {book['tone']}. "
+        f"Pitch: {book['short_pitch']}. Sample link: {book['sample_link']}"
+    )
+
+    topics_display = row_like.get("topics") or "n/a"
+    if isinstance(topics_display, list):
+        topics_display = ", ".join(topics_display)
+
+    prompt = f"""
+{profile_note}
+
+Constraints:
+- 2 or 3 sentences, warm, witty, transparent (no hard sell).
+- Don't make claims beyond the profile.
+- If links are allowed, include exactly one link: {book['sample_link']}
+- If links might be banned on the platform, omit it and suggest 'peek the sample in my profile'.
+
+Reader post:
+{row_like.get('post_text','')}
+
+Known intent: {row_like.get('intent','CURIOUS')}
+Known topics: {topics_display}
+Fit score (0-1): {row_like.get('fit_score',0.0)}
+"""
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role":"system","content":"You draft brief, kind, satirical-leaning replies in Evan's voice."},
+            {"role":"user","content": prompt}
+        ],
+        temperature=0.5,
+    )
+    return resp.choices[0].message.content.strip()
+
+# -----------------------------
+# classify-insert: label + topics + fit (+ explanations), insert, then create/update Notion
 # -----------------------------
 @app.post("/classify-insert")
 def classify_insert():
     """
     POST JSON: { "text": "...", "platform": "rss", "url": "https://..", "author": "..." }
-    → classify with GPT → topic+fit → insert into leads
+    → classify with GPT → topic+fit → insert into leads → create Notion page (and optional draft)
     """
     data = request.get_json(force=True, silent=True) or {}
     text_body = (data.get("text") or "").strip()
@@ -334,6 +429,7 @@ def classify_insert():
     fit_val = float(topicfit["fit_score"])
     explain = topicfit.get("explanations") or None
 
+    # insert lead
     sql = """
     INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score, explanations)
     VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score, :explanations)
@@ -351,13 +447,52 @@ def classify_insert():
     }
     with engine.begin() as conn:
         new_id = conn.execute(text(sql), params).scalar()
+
+    # -------- Notion Sync (direct API) --------
+    # Decide whether to auto-generate a draft now
+    auto_draft = (label == "BUY_READY" and fit_val >= 0.60) or (os.getenv("NOTION_AUTODRAFT","0") == "1")
+
+    draft_text = None
+    if auto_draft:
+        # Generate draft in-process
+        draft_text = generate_reply_text({
+            "post_text": text_body,
+            "intent": label,
+            "topics": topicfit["topics"],
+            "fit_score": fit_val
+        })
+
+    # Build Notion payload (works even if draft_text is None)
+    lead_for_notion = {
+        "id": new_id,
+        "post_text": text_body,
+        "intent": label,
+        "fit_score": fit_val,
+        "topics": topicfit["topics"],
+        "source_link": params["source_url"],
+        "draft_link": f'https://asher-agent.onrender.com/reply-draft?id={new_id}',
+    }
+
+    page_id = None
+    try:
+        page_id = create_notion_row(lead_for_notion, draft_text=draft_text)
+    except Exception:
+        # Don't fail the API if Notion is down; you can inspect logs on Render
+        page_id = None
+
+    if page_id:
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE leads SET notion_page_id=:pid WHERE id=:id"),
+                         {"pid": page_id, "id": new_id})
+
     return {
         "ok": True,
         "inserted_id": new_id,
         "label": label,
         "topics": topicfit["topics"],
         "fit_score": fit_val,
-        "explanations": explain
+        "explanations": explain,
+        "notion_page_id": page_id
     }, 200
 
 # -----------------------------
@@ -384,7 +519,7 @@ def analyze_endpoint():
 def ingest_rss():
     """
     POST JSON: { "feed": "https://..." }
-    Pull an RSS feed, classify entries, add topics/fit, insert rows.
+    Pull an RSS feed, classify entries, add topics/fit, insert rows (+ Notion sync).
     """
     body = request.get_json(force=True, silent=True) or {}
     feed_url = body.get("feed")
@@ -418,6 +553,7 @@ def ingest_rss():
         sql = """
         INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score, explanations)
         VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score, :explanations)
+        RETURNING id;
         """
         params = {
             "platform": "rss",
@@ -430,7 +566,36 @@ def ingest_rss():
             "explanations": explain
         }
         with engine.begin() as conn:
-            conn.execute(text(sql), params)
+            new_id = conn.execute(text(sql), params).scalar()
+
+        # Notion sync for each entry (without auto-draft unless enabled)
+        auto_draft = (label == "BUY_READY" and fit_val >= 0.60) or (os.getenv("NOTION_AUTODRAFT","0") == "1")
+        draft_text = None
+        if auto_draft:
+            draft_text = generate_reply_text({
+                "post_text": text_body,
+                "intent": label,
+                "topics": topicfit["topics"],
+                "fit_score": fit_val
+            })
+        lead_for_notion = {
+            "id": new_id,
+            "post_text": text_body,
+            "intent": label,
+            "fit_score": fit_val,
+            "topics": topicfit["topics"],
+            "source_link": url,
+            "draft_link": f'https://asher-agent.onrender.com/reply-draft?id={new_id}',
+        }
+        try:
+            page_id = create_notion_row(lead_for_notion, draft_text=draft_text)
+        except Exception:
+            page_id = None
+        if page_id:
+            with engine.begin() as conn:
+                conn.execute(text("UPDATE leads SET notion_page_id=:pid WHERE id=:id"),
+                             {"pid": page_id, "id": new_id})
+
         inserted += 1
 
     return {"ok": True, "feed": feed_url, "inserted": inserted}, 200
@@ -456,46 +621,20 @@ def reply_draft():
             FROM leads
             WHERE id = :id
         """), {"id": lead_id})
-        row = res.fetchone()
+        row = res.mappings().first()
 
     if not row:
         return {"ok": False, "error": f"Lead {lead_id} not found"}, 404
 
-    book = BOOKS.get(ACTIVE_BOOK, BOOKS["ASHER"])
-    profile_note = (
-        f"You're replying as the author of '{book['title']}'. "
-        f"Audience: {book['audience']}. Genres: {', '.join(book['genres'])}. "
-        f"Tropes: {', '.join(book['tropes'])}. Tone: {book['tone']}. "
-        f"Pitch: {book['short_pitch']}. Sample link: {book['sample_link']}"
-    )
-
-    prompt = f"""
-{profile_note}
-
-Constraints:
-- 2 or 3 sentences, warm, witty, transparent (no hard sell).
-- Don't make claims beyond the profile.
-- If links are allowed, include exactly one link: {book['sample_link']}
-- If links might be banned on the platform, omit it and suggest 'peek the sample in my profile'.
-
-Reader post:
-{row.post_text}
-
-Known intent: {row.intent}
-Known topics: {row.topics or 'n/a'}
-Fit score (0-1): {row.fit_score if row.fit_score is not None else 0.0}
-"""
-
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role":"system","content":"You draft brief, kind, satirical-leaning replies in Evan's voice."},
-            {"role":"user","content": prompt}
-        ],
-        temperature=0.5,
-    )
-    draft = resp.choices[0].message.content.strip()
-    return {"ok": True, "id": int(row.id), "reply": draft}, 200
+    # Prepare row-like for generator
+    topics_list = [t.strip() for t in (row["topics"] or "").split(",")] if row["topics"] else []
+    reply = generate_reply_text({
+        "post_text": row["post_text"],
+        "intent": row["intent"],
+        "topics": topics_list,
+        "fit_score": float(row["fit_score"] or 0.0)
+    })
+    return {"ok": True, "id": int(row["id"]), "reply": reply}, 200
 
 # -----------------------------
 # Root

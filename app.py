@@ -678,7 +678,7 @@ def ingest_rss():
                     {"r": draft_text, "i": new_id}
                 )
 
-        draft_link = url_for_service(request, f"/notion/fill-draft?id={new_id}&force=1}")
+        draft_link = url_for_service(request, f"/notion/fill-draft?id={new_id}&force=1")
         # (fix accidental brace if any)
         if draft_link.endswith("}"):
             draft_link = draft_link[:-1]

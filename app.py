@@ -46,30 +46,17 @@ def notion_prop(kind, value):
     raise ValueError(f"Unknown Notion kind: {kind}")
 
 def update_notion_fields(page_id: str, props: dict):
-    """
-    Shallow upsert of Notion properties; ignores if Notion is not configured.
-    props must already be in Notion's shape (e.g., {"Draft": {"rich_text": [...]}, ...})
-    """
     if not notion or not page_id:
         return
     notion.pages.update(page_id=page_id, properties=props)
 
 def url_for_service(req, path: str) -> str:
-    """
-    Build an absolute URL back to this service for convenient 'action links' in Notion.
-    """
     base = req.host_url  # includes trailing "/"
     if path.startswith("/"):
         path = path[1:]
     return base + path
 
 def create_notion_row(lead: dict, draft_text: str | None = None) -> str | None:
-    """
-    Create a Notion page for a lead. Returns page_id or None if Notion is not configured.
-    lead expects:
-      id, post_text, intent, fit_score, topics(list[str]),
-      source_link, draft_link, send_link
-    """
     if not notion:
         return None
 
@@ -97,7 +84,6 @@ def create_notion_row(lead: dict, draft_text: str | None = None) -> str | None:
     return page.get("id")
 
 def update_notion_draft(page_id: str, draft_text: str):
-    """Update an existing Notion page's Draft field."""
     if not notion or not page_id:
         return
     update_notion_fields(page_id, {"Draft": notion_prop("rich_text", draft_text[:2000])})
@@ -124,28 +110,21 @@ BOOKS = {
         "content_notes": ["romance (queer), peril, political stakes"],
         "sample_link": "https://a.co/d/4GKJm8Q"
     },
-    # "JINGLED": { ... }  # add later when you're ready
+    # "JINGLED": { ... }
 }
 
-# Set which book is currently active for matching & reply-drafts
 ACTIVE_BOOK = os.getenv("ACTIVE_BOOK", "ASHER").upper()
 
 # -----------------------------
 # Database URL (psycopg v3 + SSL for Render)
 # -----------------------------
 raw_url = os.environ.get("DATABASE_URL", "") or ""
-
-# Convert legacy schemes to SQLAlchemy's psycopg v3 dialect
-# postgres://... or postgresql://... -> postgresql+psycopg://...
 if raw_url.startswith("postgres://"):
     raw_url = "postgresql+psycopg://" + raw_url[len("postgres://"):]
 elif raw_url.startswith("postgresql://"):
     raw_url = "postgresql+psycopg://" + raw_url[len("postgresql://"):]
-
-# Ensure SSL is required (Render Postgres expects SSL)
 if raw_url and "sslmode=" not in raw_url:
     raw_url = raw_url + ("&" if "?" in raw_url else "?") + "sslmode=require"
-
 engine = create_engine(raw_url, pool_pre_ping=True)
 
 # -----------------------------
@@ -161,31 +140,30 @@ def health():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 # -----------------------------
-# Init (creates base table incl. explanations + notion_page_id)
+# Init (base table)
 # -----------------------------
 @app.post("/init")
 def init():
-    """
-    Create the leads table (idempotent).
-    """
     ddl = """
     CREATE TABLE IF NOT EXISTS leads (
         id SERIAL PRIMARY KEY,
-        platform TEXT NOT NULL,           -- 'reddit', 'rss', etc.
+        platform TEXT NOT NULL,
         source_url TEXT NOT NULL,
         author TEXT,
         post_text TEXT,
-        intent TEXT,                      -- 'BUY_READY', 'CURIOUS', etc.
-        topics TEXT,                      -- comma-separated tags (optional)
-        fit_score DOUBLE PRECISION,       -- 0.0 - 1.0 (optional)
-        explanations TEXT,                -- why the fit was scored that way (debug)
-        notion_page_id TEXT,              -- Notion page id for sync
+        intent TEXT,
+        topics TEXT,
+        fit_score DOUBLE PRECISION,
+        explanations TEXT,
+        notion_page_id TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW(),
-        -- new optional columns used by /notion/fill-draft and /send
         reply_text TEXT,
         status TEXT,
         sent_at TIMESTAMPTZ,
-        sent_ref TEXT
+        sent_ref TEXT,
+        -- NEW: learning fields
+        preset_name TEXT,
+        source_sub TEXT
     );
     """
     with engine.begin() as conn:
@@ -193,31 +171,22 @@ def init():
     return jsonify({"ok": True, "message": "leads table ready"}), 200
 
 # -----------------------------
-# Migration (adds topics + fit_score if you created the table earlier)
+# Migrations
 # -----------------------------
 @app.post("/migrate/add-topics-fit")
 def migrate_add_topics_fit():
-    ddl1 = "ALTER TABLE leads ADD COLUMN IF NOT EXISTS topics TEXT;"
-    ddl2 = "ALTER TABLE leads ADD COLUMN IF NOT EXISTS fit_score DOUBLE PRECISION;"
     with engine.begin() as conn:
-        conn.execute(text(ddl1))
-        conn.execute(text(ddl2))
+        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS topics TEXT;"))
+        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS fit_score DOUBLE PRECISION;"))
     return {"ok": True, "message": "Columns topics, fit_score ready"}, 200
 
-# -----------------------------
-# Migration (adds explanations)
-# -----------------------------
 @app.post("/migrate/add-explanations")
 def migrate_add_explanations():
-    ddl = "ALTER TABLE leads ADD COLUMN IF NOT EXISTS explanations TEXT;"
     with engine.begin() as conn:
-        conn.execute(text(ddl))
+        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS explanations TEXT;"))
     return {"ok": True, "message": "Column explanations ready"}, 200
 
-# -----------------------------
-# Migration (adds reply_text/status/sent_at)
-# -----------------------------
-@app.post("/migrate/add-send-cols")
+@app.route("/migrate/add-send-cols", methods=["GET","POST"])
 def migrate_add_send_cols():
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS reply_text TEXT;"))
@@ -225,41 +194,21 @@ def migrate_add_send_cols():
         conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;"))
     return {"ok": True, "message": "Columns reply_text, status, sent_at ready"}, 200
 
-# -----------------------------
-# NEW Migration (adds sent_ref) — step 3
-# -----------------------------
-@app.route("/migrate/add-sent-ref", methods=["GET", "POST"])
+@app.route("/migrate/add-sent-ref", methods=["GET","POST"])
 def migrate_add_sent_ref():
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS sent_ref TEXT;"))
     return {"ok": True, "message": "Column sent_ref ready"}, 200
 
-# -----------------------------
-# Insert test row
-# -----------------------------
-@app.post("/test-insert")
-def test_insert():
-    """
-    Insert one fake row to confirm writes work.
-    """
-    sql = """
-    INSERT INTO leads (platform, source_url, author, post_text, intent)
-    VALUES (:platform, :source_url, :author, :post_text, :intent)
-    RETURNING id;
-    """
-    params = {
-        "platform": "demo",
-        "source_url": "https://example.com/post/123",
-        "author": "sample_user",
-        "post_text": "I just finished White Noise and want a satire rec",
-        "intent": "BUY_READY"
-    }
+@app.route("/migrate/add-learning-cols", methods=["GET","POST"])
+def migrate_add_learning_cols():
     with engine.begin() as conn:
-        new_id = conn.execute(text(sql), params).scalar()
-    return jsonify({"ok": True, "inserted_id": new_id}), 200
+        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS preset_name TEXT;"))
+        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS source_sub TEXT;"))
+    return {"ok": True, "message": "Columns preset_name, source_sub ready"}, 200
 
 # -----------------------------
-# Count rows
+# Utilities
 # -----------------------------
 @app.get("/count")
 def count():
@@ -267,14 +216,7 @@ def count():
         n = conn.execute(text("SELECT COUNT(*) FROM leads")).scalar()
     return jsonify({"ok": True, "lead_count": n}), 200
 
-# -----------------------------
-# Intent classifier (BUY_READY / CURIOUS / OFF_TOPIC)
-# -----------------------------
 def classify_intent(text_body: str) -> dict:
-    """
-    Ask GPT to label text as BUY_READY / CURIOUS / OFF_TOPIC.
-    Returns dict like {"label": "...", "confidence": 0.0}
-    """
     prompt = f"""
     You label a short book-related post as one of:
     - BUY_READY: actively asking for the next book now
@@ -305,18 +247,13 @@ def classify_intent(text_body: str) -> dict:
         conf = 0.5
     return {"label": label, "confidence": conf}
 
-# -----------------------------
-# Enhanced Topic Taxonomy + Few-shot anchors (for stability)
-# -----------------------------
 TOPIC_TAXONOMY = {
-    "platform-intent": ["buying-now","looking-for-recs","TBR-add","library-hold","DNF","author-follow","cover-love"],
     "age-shelf": ["YA","adult","new-adult","middle-grade"],
     "genre": ["fantasy","sci-fi","romance","thriller","mystery","speculative","historical","LGBTQ+"],
     "tropes": ["enemies-to-lovers","forbidden-love","royal-romance","found-family","political-intrigue",
                "slow-burn","queer-protagonist","family-holiday-drama","corporate-conspiracy","media-critique"],
     "vibe": ["cozy","angsty","satirical","smart","character-driven","high-stakes"]
 }
-
 FEW_SHOT = [
     {
       "post": "Looking for queer YA fantasy with politics and a royal romance—bonus if it's enemies to lovers.",
@@ -330,12 +267,6 @@ FEW_SHOT = [
       "fit_asher": 0.10, "why_asher": "Not YA fantasy.",
       "fit_jingled": 0.88, "why_jingled": "Adult satire exactly on political/holiday divide."
     },
-    {
-      "post": "Just finished Red, White & Royal Blue. Need more royal romance with queer leads!",
-      "topics": ["adult","romance","royal-romance","queer-protagonist","TBR-add"],
-      "fit_asher": 0.65, "why_asher": "Queer royal romance overlap though YA fantasy vs rom-com.",
-      "fit_jingled": 0.15, "why_jingled": "Not satire."
-    }
 ]
 
 def _kebab(s: str) -> str:
@@ -344,7 +275,6 @@ def _kebab(s: str) -> str:
 def _build_analysis_prompt(post_text: str, book_profile: dict) -> str:
     return f"""You are a meticulous book-match analyst.
 Return JSON with fields: topics (array, 3-10 concise kebab-case tags), fit_score (0..1), and explanations (string).
-Be decisive; avoid generic tags.
 
 Taxonomy (examples): {json.dumps(TOPIC_TAXONOMY)}
 
@@ -358,44 +288,23 @@ Comps: {', '.join(book_profile['comps'])}
 Pitch: {book_profile['short_pitch']}
 
 Guidelines:
-- Topics: pick 5–9, draw from taxonomy when relevant, plus any sharply relevant extras you invent.
-- Fit scoring rubric (anchor these):
-  0.90–1.00: direct, obvious match (multiple overlaps on audience/genre/tropes).
-  0.70–0.89: strong partial match (2–3 major overlaps; minor mismatches ok).
-  0.40–0.69: tangential (some overlap but not core).
-  0.10–0.39: weak relevance.
-  0.00–0.09: off-topic.
-- Penalize mismatched audience/age-shelf. Boost for explicit trope & theme alignment.
-- If user is BUYING/looking-now, bias fit slightly upward when content aligns.
+- Penalize mismatched audience/age-shelf; boost explicit trope/theme alignment.
+- Use 0.90–1.00 for obvious direct matches; 0.70–0.89 for strong partial; 0.40–0.69 tangential; 0.10–0.39 weak.
+Now analyze this post and return ONLY compact JSON.
 
-Few-shot references:
-{json.dumps(FEW_SHOT, ensure_ascii=False, indent=2)}
-
-Now analyze this post:
 POST: {post_text}
-
-Return ONLY compact JSON.
 """
 
-# -----------------------------
-# Topic extraction + calibrated Fit scoring against ACTIVE_BOOK
-# -----------------------------
 def analyze_topics_and_fit(text_body: str, book_profile: dict) -> dict:
-    """
-    Return {"topics": [...], "fit_score": 0.0, "explanations": "..."} for the active book.
-    Fit score: 0 (no fit) to 1 (strong fit) based on audience/genre/tropes/themes.
-    """
-    prompt = _build_analysis_prompt(text_body, book_profile)
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "You produce compact JSON only."},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": _build_analysis_prompt(text_body, book_profile)}
         ],
         temperature=0.2
     )
     raw = resp.choices[0].message.content.strip()
-    # Parse + clamp
     try:
         data = json.loads(raw)
     except Exception:
@@ -409,46 +318,29 @@ def analyze_topics_and_fit(text_body: str, book_profile: dict) -> dict:
 
     topics = data.get("topics") or []
     topics = [_kebab(t) for t in topics if isinstance(t, str)]
-    topics = [t for t in topics if t][:10]  # 10 max
+    topics = [t for t in topics if t][:10]
 
-    return {
-        "topics": topics,
-        "fit_score": score,
-        "explanations": data.get("explanations", "")
-    }
+    return {"topics": topics, "fit_score": score, "explanations": data.get("explanations", "")}
 
-# -----------------------------
-# Helper: generate reply text (used by /reply-draft and optional auto-draft)
-# -----------------------------
 def generate_reply_text(row_like: dict) -> str:
-    """
-    row_like must have: post_text, intent, topics, fit_score
-    Uses ACTIVE_BOOK profile to produce a short reply.
-    """
     book = BOOKS.get(ACTIVE_BOOK, BOOKS["ASHER"])
     profile_note = (
         f"You're replying as the author of '{book['title']}'. "
         f"Audience: {book['audience']}. Genres: {', '.join(book['genres'])}. "
-        f"Tropes: {book['tropes']}. Tone: {book['tone']}. "
+        f"Tropes: {', '.join(book['tropes'])}. Tone: {book['tone']}. "
         f"Pitch: {book['short_pitch']}. Sample link: {book['sample_link']}"
     )
-
     topics_display = row_like.get("topics") or "n/a"
-    if isinstance(topics_display, list):
-        topics_display = ", ".join(topics_display)
-
+    if isinstance(topics_display, list): topics_display = ", ".join(topics_display)
     prompt = f"""
 {profile_note}
 
 Constraints:
-- 2 or 3 sentences, warm, witty, transparent (no hard sell).
-- Don't make claims beyond the profile.
+- 2–3 sentences, warm, witty, transparent.
 - If links are allowed, include exactly one link: {book['sample_link']}
-- If links might be banned on the platform, omit it and suggest 'peek the sample in my profile'.
 
 Reader post:
 {row_like.get('post_text','')}
-
 Known intent: {row_like.get('intent','CURIOUS')}
 Known topics: {topics_display}
 Fit score (0-1): {row_like.get('fit_score',0.0)}
@@ -456,7 +348,7 @@ Fit score (0-1): {row_like.get('fit_score',0.0)}
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role":"system","content":"You draft brief, kind, satirical-leaning replies in Evan's voice."},
+            {"role":"system","content":"You draft brief, kind replies in the author's voice."},
             {"role":"user","content": prompt}
         ],
         temperature=0.5,
@@ -464,31 +356,23 @@ Fit score (0-1): {row_like.get('fit_score',0.0)}
     return resp.choices[0].message.content.strip()
 
 # -----------------------------
-# classify-insert: label + topics + fit (+ explanations), insert, then create/update Notion
+# classify-insert
 # -----------------------------
 @app.post("/classify-insert")
 def classify_insert():
-    """
-    POST JSON: { "text": "...", "platform": "rss", "url": "https://..", "author": "..." }
-    → classify with GPT → topic+fit → insert into leads → create Notion page (and optional draft)
-    """
     data = request.get_json(force=True, silent=True) or {}
     text_body = (data.get("text") or "").strip()
     if not text_body:
         return {"ok": False, "error": "Missing 'text' in JSON body"}, 400
 
-    # intent
     result = classify_intent(text_body)
     label = result["label"]
-
-    # topics + fit (against active book profile)
     book = BOOKS.get(ACTIVE_BOOK, BOOKS["ASHER"])
     topicfit = analyze_topics_and_fit(text_body, book)
     topics_csv = ", ".join(topicfit["topics"]) if topicfit["topics"] else None
     fit_val = float(topicfit["fit_score"])
     explain = topicfit.get("explanations") or None
 
-    # insert lead
     sql = """
     INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score, explanations, status)
     VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score, :explanations, :status)
@@ -508,27 +392,18 @@ def classify_insert():
     with engine.begin() as conn:
         new_id = conn.execute(text(sql), params).scalar()
 
-    # -------- Notion Sync (direct API) --------
-    # Decide whether to auto-generate a draft now
     auto_draft = (label == "BUY_READY" and fit_val >= 0.60) or (os.getenv("NOTION_AUTODRAFT","0") == "1")
-
     draft_text = None
     if auto_draft:
-        # Generate draft in-process
         draft_text = generate_reply_text({
             "post_text": text_body,
             "intent": label,
             "topics": topicfit["topics"],
             "fit_score": fit_val
         })
-        # Persist draft to DB for re-use
         with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE leads SET reply_text=:r WHERE id=:i"),
-                {"r": draft_text, "i": new_id}
-            )
+            conn.execute(text("UPDATE leads SET reply_text=:r WHERE id=:i"), {"r": draft_text, "i": new_id})
 
-    # Build Notion payload (works even if draft_text is None)
     draft_link = url_for_service(request, f"/notion/fill-draft?id={new_id}&force=1")
     send_link  = url_for_service(request, f"/send?id={new_id}")
 
@@ -542,13 +417,11 @@ def classify_insert():
         "draft_link": draft_link,
         "send_link": send_link,
     }
-
     page_id = None
     try:
         page_id = create_notion_row(lead_for_notion, draft_text=draft_text)
     except Exception:
         page_id = None
-
     if page_id:
         with engine.begin() as conn:
             conn.execute(text("UPDATE leads SET notion_page_id=:pid WHERE id=:id"),
@@ -574,16 +447,13 @@ def notion_diag():
         info["error"] = "Notion client not initialized. Check NOTION_TOKEN and NOTION_DB_ID."
         return info, 200
     try:
-        # 1) Can we read the database?
         db = notion.databases.retrieve(database_id=NOTION_DB_ID)
         info["db_ok"] = True
         info["db_title"] = db.get("title", [{}])[0].get("plain_text", "")
         props = list(db.get("properties", {}).keys())
         info["props"] = props[:20]
-
         if "Post (snippet)" not in props:
-            return {**info, "error": 'Missing required Notion property: "Post (snippet)". Rename your title column to exactly that.'}, 200
-
+            return {**info, "error": 'Missing required Notion property: "Post (snippet)".'}, 200
         page = notion.pages.create(
             parent={"database_id": NOTION_DB_ID},
             properties={"Post (snippet)": {"title": [{"type": "text","text": {"content": "[diag] connectivity test"}}]}}
@@ -591,23 +461,11 @@ def notion_diag():
         notion.pages.update(page_id=page["id"], archived=True)
         info["create_ok"] = True
         return info, 200
-
     except Exception as e:
-        return {
-            **info,
-            "error": f"{type(e).__name__}: {e}",
-            "trace": traceback.format_exc()[:2000]
-        }, 200
+        return {**info, "error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[:2000]}, 200
 
-# -----------------------------
-# Optional: quick analyzer endpoint for ad-hoc tests
-# -----------------------------
 @app.post("/analyze")
 def analyze_endpoint():
-    """
-    POST JSON: { "post_text": "..." }
-    Returns analyzer output without inserting into DB.
-    """
     body = request.get_json(force=True, silent=True) or {}
     post_text = (body.get("post_text") or "").strip()
     if not post_text:
@@ -617,27 +475,18 @@ def analyze_endpoint():
     return jsonify({"ok": True, **result}), 200
 
 # ============================================================
-# NEW: Reddit comb (RSS-based, no API keys) — /ingest/reddit_rss
+# Reddit comb (RSS-based) + Presets
 # ============================================================
 def _bool_arg(val: str | None, default: bool) -> bool:
-    if val is None:
-        return default
-    return str(val).lower() in ("1", "true", "yes", "on")
+    if val is None: return default
+    return str(val).lower() in ("1","true","yes","on")
+
+def _sub_from_url(url: str) -> str | None:
+    m = re.search(r"reddit\.com/r/([^/]+)/", url, re.I)
+    return m.group(1) if m else None
 
 @app.route("/ingest/reddit_rss", methods=["GET", "POST"])
 def ingest_reddit_rss():
-    """
-    Discover candidate posts on Reddit via RSS (no auth).
-    GET query params (or POST JSON):
-      sub: comma-separated subreddits (e.g., 'books,YAlit')  [required]
-      q:   search query (URL-encoded automatically)           [required]
-      sort: 'new' or 'relevance' (default: 'new')
-      limit: per-subreddit item cap (default: 10)
-      autodraft: 0/1 to force-disable/enable draft writes (default behavior:
-                  only auto-draft BUY_READY & fit>=0.60 or NOTION_AUTODRAFT=1)
-
-    Returns: { ok, total_inserted, per_sub: {sub: n}, samples: [ids...] }
-    """
     if request.method == "POST":
         body = request.get_json(force=True, silent=True) or {}
         subs = body.get("sub") or body.get("subs") or ""
@@ -645,35 +494,27 @@ def ingest_reddit_rss():
         sort = (body.get("sort") or "new").lower()
         limit = int(body.get("limit") or 10)
         autodraft_override = body.get("autodraft")
+        preset_name = body.get("preset") or body.get("tag") or None
     else:
         subs = request.args.get("sub", "")
         q = request.args.get("q", "")
         sort = (request.args.get("sort") or "new").lower()
         limit = int(request.args.get("limit") or 10)
         autodraft_override = request.args.get("autodraft")
+        preset_name = request.args.get("preset") or request.args.get("tag")
 
     subs_list = [s.strip() for s in subs.split(",") if s.strip()]
     if not subs_list or not q:
-        return {
-            "ok": False,
-            "error": "Provide both 'sub' (comma list) and 'q' (query)."
-        }, 400
-    sort = "new" if sort not in ("new", "relevance") else sort
+        return {"ok": False, "error": "Provide both 'sub' (comma list) and 'q' (query)."}, 400
+    sort = "new" if sort not in ("new","relevance") else sort
 
-    # Determine auto-draft policy for THIS run
-    # Default mirrors your existing logic unless autodraft=0 explicitly disables it.
-    force_autodraft_off = (_bool_arg(str(autodraft_override), False) is True and str(autodraft_override).strip() in ("0", "false", "no"))
-    # detect explicit on
-    force_autodraft_on = (_bool_arg(str(autodraft_override), False) is True and str(autodraft_override).strip() in ("1", "true", "yes"))
-
-    per_sub_counts = {}
-    inserted_ids = []
-    total = 0
+    # autodraft policy for this run
+    force_off = (str(autodraft_override).strip().lower() in ("0","false","no"))
+    force_on  = (str(autodraft_override).strip().lower() in ("1","true","yes"))
+    per_sub_counts, inserted_ids, total = {}, [], 0
     book = BOOKS.get(ACTIVE_BOOK, BOOKS["ASHER"])
 
     for sub in subs_list:
-        # Build RSS search URL:
-        # https://www.reddit.com/r/<sub>/search.rss?q=<query>&restrict_sr=1&sort=<sort>
         q_enc = urllib.parse.quote_plus(q)
         rss_url = f"https://www.reddit.com/r/{sub}/search.rss?q={q_enc}&restrict_sr=1&sort={sort}"
         feed = feedparser.parse(rss_url)
@@ -681,35 +522,28 @@ def ingest_reddit_rss():
         count_for_sub = 0
         for e in feed.entries[:limit]:
             url = getattr(e, "link", "")
-            if not url:
-                continue
+            if not url: continue
 
-            # optional: skip duplicates by URL
+            # skip duplicates
             with engine.connect() as conn:
                 exists = conn.execute(text("SELECT 1 FROM leads WHERE source_url=:u LIMIT 1"), {"u": url}).first()
-            if exists:
-                continue
+            if exists: continue
 
             author = getattr(e, "author", "reddit_user")
             title = getattr(e, "title", "") or ""
             summary = getattr(e, "summary", "") or ""
-            # some RSS summaries contain HTML; keep it simple
             text_body = (title.strip() + "\n\n" + re.sub(r"<[^>]+>", "", summary)).strip()
 
-            # classify intent
             result = classify_intent(text_body)
             label = result["label"]
-
-            # topics + fit
             topicfit = analyze_topics_and_fit(text_body, book)
             topics_csv = ", ".join(topicfit["topics"]) if topicfit["topics"] else None
             fit_val = float(topicfit["fit_score"])
             explain = topicfit.get("explanations") or None
 
-            # insert
             sql = """
-            INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score, explanations, status)
-            VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score, :explanations, :status)
+            INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score, explanations, status, preset_name, source_sub)
+            VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score, :explanations, :status, :preset_name, :source_sub)
             RETURNING id;
             """
             params = {
@@ -721,19 +555,16 @@ def ingest_reddit_rss():
                 "topics": topics_csv,
                 "fit_score": fit_val,
                 "explanations": explain,
-                "status": "new"
+                "status": "new",
+                "preset_name": preset_name,
+                "source_sub": sub or _sub_from_url(url)
             }
             with engine.begin() as conn:
                 new_id = conn.execute(text(sql), params).scalar()
 
-            # Decide whether to auto-generate a draft now for this run
-            auto_draft_default = (label == "BUY_READY" and fit_val >= 0.60) or (os.getenv("NOTION_AUTODRAFT","0") == "1")
-            auto_draft = auto_draft_default
-            if force_autodraft_off:
-                auto_draft = False
-            elif force_autodraft_on:
-                auto_draft = True
-
+            # auto-draft logic
+            auto_default = (label == "BUY_READY" and fit_val >= 0.60) or (os.getenv("NOTION_AUTODRAFT","0") == "1")
+            auto_draft = (False if force_off else True if force_on else auto_default)
             draft_text = None
             if auto_draft:
                 draft_text = generate_reply_text({
@@ -743,15 +574,11 @@ def ingest_reddit_rss():
                     "fit_score": fit_val
                 })
                 with engine.begin() as conn:
-                    conn.execute(
-                        text("UPDATE leads SET reply_text=:r WHERE id=:i"),
-                        {"r": draft_text, "i": new_id}
-                    )
+                    conn.execute(text("UPDATE leads SET reply_text=:r WHERE id=:i"), {"r": draft_text, "i": new_id})
 
             # Notion sync
             draft_link = url_for_service(request, f"/notion/fill-draft?id={new_id}&force=1")
             send_link  = url_for_service(request, f"/send?id={new_id}")
-
             lead_for_notion = {
                 "id": new_id,
                 "post_text": text_body,
@@ -777,179 +604,127 @@ def ingest_reddit_rss():
 
         per_sub_counts[sub] = count_for_sub
 
-    return {
-        "ok": True,
-        "query": q,
-        "subs": subs_list,
-        "per_sub": per_sub_counts,
-        "total_inserted": total,
-        "samples": inserted_ids[:10]
-    }, 200
+    return {"ok": True, "query": q, "subs": subs_list, "per_sub": per_sub_counts, "total_inserted": total, "samples": inserted_ids[:10]}, 200
 
 # -----------------------------
-# ingest/rss: pull, label + topics + fit for each entry
+# Preset definitions + runner
 # -----------------------------
-@app.post("/ingest/rss")
-def ingest_rss():
+PRESETS = {
+    "asher-hot": {
+        "subs": ["books","YAlit","FantasyBooks"],
+        "q": "queer YA fantasy OR (royal romance) OR (enemies to lovers) politics",
+        "sort": "new",
+        "limit": 10,
+        "autodraft": "0"
+    },
+    "jingled-holiday": {
+        "subs": ["books","booksuggestions","fiction"],
+        "q": "holiday satire OR dark comedy family politics christmas drama",
+        "sort": "new",
+        "limit": 12,
+        "autodraft": "0"
+    }
+}
+
+def _enabled_presets():
+    env = os.getenv("PRESETS_ENABLE","").strip()
+    if not env:
+        return list(PRESETS.keys())
+    return [n.strip() for n in env.split(",") if n.strip() and n.strip() in PRESETS]
+
+@app.route("/ingest/run-presets", methods=["GET"])
+def run_presets():
     """
-    POST JSON: { "feed": "https://..." }
-    Pull an RSS feed, classify entries, add topics/fit, insert rows (+ Notion sync).
+    Run one preset by ?name=..., or all enabled presets if no name is provided.
+    If AUTODISCOVER_SUBS=1, we expand each preset's subs using recent high-fit leads.
     """
-    body = request.get_json(force=True, silent=True) or {}
-    feed_url = body.get("feed")
-    if not feed_url:
-        return {"ok": False, "error": "Provide 'feed' URL in JSON"}, 400
+    name = request.args.get("name")
+    names = [name] if name else _enabled_presets()
+    ran, results = [], {}
+    autodiscover = os.getenv("AUTODISCOVER_SUBS","0") == "1"
+    max_auto = int(os.getenv("PRESET_MAX_AUTODISCOVER","4"))
 
-    feed = feedparser.parse(feed_url)
-    if not feed.entries:
-        return {"ok": False, "feed": feed_url, "inserted": 0, "error": "No entries found"}, 200
+    for n in names:
+        preset = PRESETS.get(n)
+        if not preset:
+            results[n] = {"ok": False, "error": "unknown preset"}
+            continue
 
-    inserted = 0
-    book = BOOKS.get(ACTIVE_BOOK, BOOKS["ASHER"])
-    for e in feed.entries[:20]:  # limit for now
-        url = getattr(e, "link", "n/a")
-        author = getattr(e, "author", "n/a")
-        title = getattr(e, "title", "")
-        summary = getattr(e, "summary", "")
-        text_body = (title + "\n\n" + summary).strip()
+        subs = list(preset["subs"])
+        q = preset["q"]
+        sort = preset.get("sort","new")
+        limit = int(preset.get("limit",10))
+        autodraft = preset.get("autodraft","0")
 
-        # classify intent
-        result = classify_intent(text_body)
-        label = result["label"]
+        # optional: expand with high-fit recent subreddits
+        if autodiscover:
+            with engine.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT DISTINCT source_sub
+                    FROM leads
+                    WHERE platform='reddit' AND fit_score >= 0.75 AND source_sub IS NOT NULL
+                    ORDER BY created_at DESC
+                    LIMIT 40
+                """)).mappings().all()
+            winners = [r["source_sub"] for r in rows if r["source_sub"]]
+            for s in winners:
+                if s not in subs and len(subs) < len(preset["subs"]) + max_auto:
+                    subs.append(s)
 
-        # topics + fit
-        topicfit = analyze_topics_and_fit(text_body, book)
-        topics_csv = ", ".join(topicfit["topics"]) if topicfit["topics"] else None
-        fit_val = float(topicfit["fit_score"])
-        explain = topicfit.get("explanations") or None
+        # call the RSS ingester for this preset
+        qs = urllib.parse.urlencode({
+            "sub": ",".join(subs),
+            "q": q,
+            "sort": sort,
+            "limit": limit,
+            "autodraft": autodraft,
+            "preset": n
+        })
+        with app.test_request_context(f"/ingest/reddit_rss?{qs}", method="GET"):
+            resp, status = ingest_reddit_rss()
+        results[n] = {"status": status, "result": resp}
+        ran.append(n)
 
-        # insert
-        sql = """
-        INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score, explanations, status)
-        VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score, :explanations, :status)
-        RETURNING id;
-        """
-        params = {
-            "platform": "rss",
-            "source_url": url,
-            "author": author,
-            "post_text": text_body[:5000],  # safety slice
-            "intent": label,
-            "topics": topics_csv,
-            "fit_score": fit_val,
-            "explanations": explain,
-            "status": "new"
-        }
-        with engine.begin() as conn:
-            new_id = conn.execute(text(sql), params).scalar()
-
-        # Notion sync (respect NOTION_AUTODRAFT)
-        auto_draft = (label == "BUY_READY" and fit_val >= 0.60) or (os.getenv("NOTION_AUTODRAFT","0") == "1")
-        draft_text = None
-        if auto_draft:
-            draft_text = generate_reply_text({
-                "post_text": text_body,
-                "intent": label,
-                "topics": topicfit["topics"],
-                "fit_score": fit_val
-            })
-            with engine.begin() as conn:
-                conn.execute(
-                    text("UPDATE leads SET reply_text=:r WHERE id=:i"),
-                    {"r": draft_text, "i": new_id}
-                )
-
-        draft_link = url_for_service(request, f"/notion/fill-draft?id={new_id}&force=1")
-        send_link  = url_for_service(request, f"/send?id={new_id}")
-
-        lead_for_notion = {
-            "id": new_id,
-            "post_text": text_body,
-            "intent": label,
-            "fit_score": fit_val,
-            "topics": topicfit["topics"],
-            "source_link": url,
-            "draft_link": draft_link,
-            "send_link": send_link,
-        }
-        try:
-            page_id = create_notion_row(lead_for_notion, draft_text=draft_text)
-        except Exception:
-            page_id = None
-        if page_id:
-            with engine.begin() as conn:
-                conn.execute(text("UPDATE leads SET notion_page_id=:pid WHERE id=:id"),
-                             {"pid": page_id, "id": new_id})
-
-        inserted += 1
-
-    return {"ok": True, "feed": feed_url, "inserted": inserted}, 200
+    return {"ok": True, "ran": ran, "results": results}, 200
 
 # -----------------------------
-# reply-draft: generate a 2–3 sentence reply in your voice using the active book profile
+# Simple metrics to guide learning
 # -----------------------------
-@app.post("/reply-draft")
-def reply_draft():
+@app.get("/metrics/presets")
+def metrics_presets():
+    q = """
+    SELECT
+      COALESCE(preset_name,'(none)') AS preset,
+      COALESCE(source_sub,'(unknown)') AS subreddit,
+      COUNT(*) AS leads,
+      AVG(fit_score) AS avg_fit,
+      SUM(CASE WHEN intent='BUY_READY' THEN 1 ELSE 0 END) AS buy_ready
+    FROM leads
+    WHERE platform='reddit'
+    GROUP BY 1,2
+    ORDER BY preset, avg_fit DESC NULLS LAST, leads DESC;
     """
-    POST JSON: { "id": <lead_id> }
-    Returns a short reply tailored to the reader + active book.
-    """
-    data = request.get_json(force=True, silent=True) or {}
-    lead_id = data.get("id")
-    if not lead_id:
-        return {"ok": False, "error": "Provide lead 'id' in JSON"}, 400
-
-    # fetch the lead
     with engine.connect() as conn:
-        res = conn.execute(text("""
-            SELECT id, platform, source_url, author, post_text, intent, topics, fit_score
-            FROM leads
-            WHERE id = :id
-        """), {"id": lead_id})
-        row = res.mappings().first()
-
-    if not row:
-        return {"ok": False, "error": f"Lead {lead_id} not found"}, 404
-
-    # Prepare row-like for generator
-    topics_list = [t.strip() for t in (row["topics"] or "").split(",")] if row["topics"] else []
-    reply = generate_reply_text({
-        "post_text": row["post_text"],
-        "intent": row["intent"],
-        "topics": topics_list,
-        "fit_score": float(row["fit_score"] or 0.0)
-    })
-    return {"ok": True, "id": int(row["id"]), "reply": reply}, 200
+        rows = [dict(r) for r in conn.execute(text(q)).mappings().all()]
+    return {"ok": True, "rows": rows}, 200
 
 # -----------------------------
-# Notion fill-draft (clickable from Notion)
+# Notion fill-draft
 # -----------------------------
 @app.get("/notion/fill-draft")
 def notion_fill_draft():
-    """
-    GET /notion/fill-draft?id=LEAD_ID&force=1
-    Generates (or reuses) a draft reply, stores it in DB, writes 'Draft' in Notion,
-    sets Status='Drafted', and ensures action links exist.
-    """
     lead_id = request.args.get("id", type=int)
     force = request.args.get("force", default=0, type=int)
+    if not lead_id: return jsonify({"ok": False, "error": "Missing id"}), 400
 
-    if not lead_id:
-        return jsonify({"ok": False, "error": "Missing id"}), 400
-
-    # fetch the lead with reply_text + notion_page_id
     with engine.connect() as conn:
         row = conn.execute(text("""
             SELECT id, platform, source_url, author, post_text, intent, topics, fit_score,
                    explanations, notion_page_id, created_at, reply_text
-            FROM leads
-            WHERE id = :id
+            FROM leads WHERE id = :id
         """), {"id": lead_id}).mappings().first()
+    if not row: return jsonify({"ok": False, "error": "Lead not found"}), 404
 
-    if not row:
-        return jsonify({"ok": False, "error": "Lead not found"}), 404
-
-    # Decide whether to reuse or regenerate
     draft = row["reply_text"]
     regenerated = False
     if force or not (draft and draft.strip()):
@@ -965,13 +740,10 @@ def notion_fill_draft():
             conn.execute(text("UPDATE leads SET reply_text=:r WHERE id=:i"), {"r": draft, "i": row["id"]})
 
     page_id = row["notion_page_id"]
-    if not page_id:
-        return jsonify({"ok": False, "error": "No linked Notion page_id for this lead"}), 400
+    if not page_id: return jsonify({"ok": False, "error": "No linked Notion page_id for this lead"}), 400
 
-    # Write to Notion: Draft, Status, ensure Draft/Send links
     draft_link = url_for_service(request, f"/notion/fill-draft?id={row['id']}&force=1")
     send_link  = url_for_service(request, f"/send?id={row['id']}")
-
     props = {
         "Draft":       notion_prop("rich_text", draft),
         "Status":      notion_prop("select", {"name": "Drafted"}),
@@ -983,19 +755,12 @@ def notion_fill_draft():
     except Exception as e:
         return jsonify({"ok": False, "error": f"Notion update failed: {e}"}), 500
 
-    return jsonify({
-        "ok": True,
-        "lead_id": int(row["id"]),
-        "regenerated": regenerated,
-        "notion_page_id": page_id,
-        "draft_preview": draft[:240]
-    }), 200
+    return jsonify({"ok": True, "lead_id": int(row["id"]), "regenerated": regenerated, "notion_page_id": page_id, "draft_preview": draft[:240]}), 200
 
 # -----------------------------
-# Send helpers (feature-flagged live posting)
+# Send (shim or live-when-enabled)
 # -----------------------------
-def _is_live() -> bool:
-    return os.getenv("SEND_LIVE", "0") == "1"
+def _is_live() -> bool: return os.getenv("SEND_LIVE", "0") == "1"
 
 def _send_allowed(platform: str) -> bool:
     allow = (os.getenv("SEND_PLATFORMS", "reddit").split(","))
@@ -1003,20 +768,11 @@ def _send_allowed(platform: str) -> bool:
     return platform.lower() in allow
 
 def _reddit_reply(source_url: str, reply_text: str) -> dict:
-    """
-    Reply in-place on Reddit under source_url (submission or comment).
-    Returns {"permalink": "...", "id": "..."}.
-    Requires PRAW env vars and SEND_LIVE=1 to actually post.
-    In dry-run, returns {"permalink": None, "id": None}.
-    """
-    if not _is_live():
-        return {"permalink": None, "id": None}
-
+    if not _is_live(): return {"permalink": None, "id": None}
     try:
         import praw
     except Exception as e:
         raise RuntimeError("praw is not installed. Add 'praw==7.8.1' to requirements.txt.") from e
-
     reddit = praw.Reddit(
         client_id=os.getenv("REDDIT_CLIENT_ID"),
         client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
@@ -1024,7 +780,6 @@ def _reddit_reply(source_url: str, reply_text: str) -> dict:
         password=os.getenv("REDDIT_PASSWORD"),
         user_agent=os.getenv("REDDIT_USER_AGENT", "asher-agent/1.0"),
     )
-
     m = re.search(r"/comments/([a-z0-9]+)/[^/]+(?:/([a-z0-9]+))?", source_url, re.I)
     if not m:
         try:
@@ -1035,88 +790,53 @@ def _reddit_reply(source_url: str, reply_text: str) -> dict:
             thing = reddit.submission(url=source_url)
             posted = thing.reply(reply_text)
             return {"permalink": f"https://www.reddit.com{posted.permalink}", "id": posted.id}
-
     sub_id, comment_id = m.group(1), m.group(2)
     if comment_id:
-        parent = reddit.comment(comment_id)
-        posted = parent.reply(reply_text)
+        parent = reddit.comment(comment_id); posted = parent.reply(reply_text)
     else:
-        parent = reddit.submission(submission_id=sub_id)
-        posted = parent.reply(reply_text)
-
+        parent = reddit.submission(submission_id=sub_id); posted = parent.reply(reply_text)
     return {"permalink": f"https://www.reddit.com{posted.permalink}", "id": posted.id}
 
-# -----------------------------
-# Send (still safe by default)
-# -----------------------------
 @app.get("/send")
 def send_route():
-    """
-    GET /send?id=LEAD_ID
-    - If SEND_LIVE=0 (default), does NOT publish; marks Posted for flow testing.
-    - If SEND_LIVE=1 and platform allowed, publishes and writes Permalink + sent_ref.
-    """
     lead_id = request.args.get("id", type=int)
-    if not lead_id:
-        return jsonify({"ok": False, "error": "Missing id"}), 400
+    if not lead_id: return jsonify({"ok": False, "error": "Missing id"}), 400
 
     with engine.connect() as conn:
         row = conn.execute(text("""
             SELECT id, platform, source_url, author, post_text, intent, topics, fit_score,
                    explanations, notion_page_id, created_at, reply_text
-            FROM leads
-            WHERE id = :id
+            FROM leads WHERE id = :id
         """), {"id": lead_id}).mappings().first()
-
-    if not row:
-        return jsonify({"ok": False, "error": "Lead not found"}), 404
+    if not row: return jsonify({"ok": False, "error": "Lead not found"}), 404
     if not row["reply_text"] or not row["reply_text"].strip():
         return jsonify({"ok": False, "error": "No draft exists. Use /notion/fill-draft first."}), 400
 
     platform = (row["platform"] or "").lower()
     source_url = row["source_url"] or ""
     draft_text = row["reply_text"].strip()
-
-    permalink = None
-    sent_ref = None
+    permalink = None; sent_ref = None
 
     if _send_allowed(platform) and platform == "reddit":
         try:
             res = _reddit_reply(source_url, draft_text)
-            permalink = res.get("permalink")
-            sent_ref = res.get("id")
+            permalink = res.get("permalink"); sent_ref = res.get("id")
         except Exception as e:
             return jsonify({"ok": False, "error": f"Reddit send failed: {e}"}), 500
-    else:
-        pass
 
     sent_at = datetime.now(timezone.utc)
     with engine.begin() as conn:
-        conn.execute(
-            text("UPDATE leads SET status='posted', sent_at=:t, sent_ref=:r WHERE id=:i"),
-            {"t": sent_at, "r": sent_ref, "i": row["id"]}
-        )
+        conn.execute(text("UPDATE leads SET status='posted', sent_at=:t, sent_ref=:r WHERE id=:i"),
+                     {"t": sent_at, "r": sent_ref, "i": row["id"]})
 
     if row["notion_page_id"]:
-        props = {
-            "Status": notion_prop("select", {"name": "Posted"}),
-        }
-        if permalink:
-            props["Permalink"] = notion_prop("url", permalink)
-        try:
-            update_notion_fields(row["notion_page_id"], props)
-        except Exception:
-            pass
+        props = {"Status": notion_prop("select", {"name": "Posted"})}
+        if permalink: props["Permalink"] = notion_prop("url", permalink)
+        try: update_notion_fields(row["notion_page_id"], props)
+        except Exception: pass
 
-    return jsonify({
-        "ok": True,
-        "lead_id": int(row["id"]),
-        "platform": platform,
-        "source_url": source_url,
-        "permalink": permalink,
-        "sent_at": sent_at.isoformat(),
-        "live": _is_live()
-    }), 200
+    return jsonify({"ok": True, "lead_id": int(row["id"]), "platform": platform, "source_url": source_url,
+                    "permalink": permalink, "sent_at": sent_at.isoformat(), "live": _is_live()}), 200
 
 # -----------------------------
 # Root

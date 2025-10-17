@@ -6,5 +6,5 @@ openai==1.40.0
 httpx==0.27.2
 feedparser==6.0.11
 notion-client
-
+praw==7.8.1
 

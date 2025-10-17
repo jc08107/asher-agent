@@ -2,7 +2,7 @@ import os
 import json
 import re
 import feedparser
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask, jsonify, request
 from sqlalchemy import create_engine, text
 from openai import OpenAI
@@ -25,16 +25,53 @@ notion = NotionClient(auth=NOTION_TOKEN) if (NOTION_TOKEN and NOTION_DB_ID) else
 def _ms_text(s: str):
     return [{"type": "text", "text": {"content": (s or "")[:2000]}}]
 
+def notion_prop(kind, value):
+    """
+    kind: 'rich_text' | 'select' | 'date' | 'url' | 'number' | 'title'
+    returns a Notion property payload fragment suitable for pages.update/create
+    """
+    if kind == "rich_text":
+        return {"rich_text": _ms_text(value or "")}
+    if kind == "select":
+        return {"select": value}  # expects {"name": "..."}
+    if kind == "date":
+        return {"date": value}    # expects {"start": iso}
+    if kind == "url":
+        return {"url": value or None}
+    if kind == "number":
+        return {"number": value}
+    if kind == "title":
+        return {"title": _ms_text(value or "")}
+    raise ValueError(f"Unknown Notion kind: {kind}")
+
+def update_notion_fields(page_id: str, props: dict):
+    """
+    Shallow upsert of Notion properties; ignores if Notion is not configured.
+    props must already be in Notion's shape (e.g., {"Draft": {"rich_text": [...]}, ...})
+    """
+    if not notion or not page_id:
+        return
+    notion.pages.update(page_id=page_id, properties=props)
+
+def url_for_service(req, path: str) -> str:
+    """
+    Build an absolute URL back to this service for convenient 'action links' in Notion.
+    """
+    base = req.host_url  # includes trailing "/"
+    if path.startswith("/"):
+        path = path[1:]
+    return base + path
+
 def create_notion_row(lead: dict, draft_text: str | None = None) -> str | None:
     """
     Create a Notion page for a lead. Returns page_id or None if Notion is not configured.
     lead expects:
-      id, post_text, intent, fit_score, topics(list[str]), source_link, draft_link
+      id, post_text, intent, fit_score, topics(list[str]),
+      source_link, draft_link, send_link
     """
     if not notion:
         return None
 
-    # Map topics to Notion multi_select
     topics = [{"name": t} for t in (lead.get("topics") or []) if t]
 
     props = {
@@ -44,6 +81,7 @@ def create_notion_row(lead: dict, draft_text: str | None = None) -> str | None:
         "Topics":        {"multi_select": topics},
         "Source Link":   {"url": lead.get("source_link") or None},
         "Draft Link":    {"url": lead.get("draft_link") or None},
+        "Send Link":     {"url": lead.get("send_link") or None},
         "Status":        {"select": {"name": "New"}},
         "Lead ID":       {"number": int(lead["id"]) if lead.get("id") is not None else None},
     }
@@ -61,10 +99,7 @@ def update_notion_draft(page_id: str, draft_text: str):
     """Update an existing Notion page's Draft field."""
     if not notion or not page_id:
         return
-    notion.pages.update(
-        page_id=page_id,
-        properties={"Draft": {"rich_text": _ms_text(draft_text[:2000])}}
-    )
+    update_notion_fields(page_id, {"Draft": notion_prop("rich_text", draft_text[:2000])})
 
 app = Flask(__name__)
 
@@ -144,7 +179,11 @@ def init():
         fit_score DOUBLE PRECISION,       -- 0.0 - 1.0 (optional)
         explanations TEXT,                -- why the fit was scored that way (debug)
         notion_page_id TEXT,              -- Notion page id for sync
-        created_at TIMESTAMPTZ DEFAULT NOW()
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        -- new optional columns used by /notion/fill-draft and /send
+        reply_text TEXT,
+        status TEXT,
+        sent_at TIMESTAMPTZ
     );
     """
     with engine.begin() as conn:
@@ -173,7 +212,16 @@ def migrate_add_explanations():
         conn.execute(text(ddl))
     return {"ok": True, "message": "Column explanations ready"}, 200
 
-# (Removed the temporary /migrate/add-notion-page-id route per instructions)
+# -----------------------------
+# Migration (adds reply_text/status/sent_at)
+# -----------------------------
+@app.post("/migrate/add-send-cols")
+def migrate_add_send_cols():
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS reply_text TEXT;"))
+        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS status TEXT;"))
+        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;"))
+    return {"ok": True, "message": "Columns reply_text, status, sent_at ready"}, 200
 
 # -----------------------------
 # Insert test row
@@ -431,8 +479,8 @@ def classify_insert():
 
     # insert lead
     sql = """
-    INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score, explanations)
-    VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score, :explanations)
+    INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score, explanations, status)
+    VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score, :explanations, :status)
     RETURNING id;
     """
     params = {
@@ -443,7 +491,8 @@ def classify_insert():
         "intent": label,
         "topics": topics_csv,
         "fit_score": fit_val,
-        "explanations": explain
+        "explanations": explain,
+        "status": "new"
     }
     with engine.begin() as conn:
         new_id = conn.execute(text(sql), params).scalar()
@@ -461,8 +510,17 @@ def classify_insert():
             "topics": topicfit["topics"],
             "fit_score": fit_val
         })
+        # Persist draft to DB for re-use
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE leads SET reply_text=:r WHERE id=:i"),
+                {"r": draft_text, "i": new_id}
+            )
 
     # Build Notion payload (works even if draft_text is None)
+    draft_link = url_for_service(request, f"/notion/fill-draft?id={new_id}&force=1")
+    send_link  = url_for_service(request, f"/send?id={new_id}")
+
     lead_for_notion = {
         "id": new_id,
         "post_text": text_body,
@@ -470,14 +528,14 @@ def classify_insert():
         "fit_score": fit_val,
         "topics": topicfit["topics"],
         "source_link": params["source_url"],
-        "draft_link": f'https://asher-agent.onrender.com/reply-draft?id={new_id}',
+        "draft_link": draft_link,
+        "send_link": send_link,
     }
 
     page_id = None
     try:
         page_id = create_notion_row(lead_for_notion, draft_text=draft_text)
     except Exception:
-        # Don't fail the API if Notion is down; you can inspect logs on Render
         page_id = None
 
     if page_id:
@@ -492,7 +550,9 @@ def classify_insert():
         "topics": topicfit["topics"],
         "fit_score": fit_val,
         "explanations": explain,
-        "notion_page_id": page_id
+        "notion_page_id": page_id,
+        "draft_link": draft_link,
+        "send_link": send_link
     }, 200
 
 @app.get("/notion/diag")
@@ -510,8 +570,6 @@ def notion_diag():
         props = list(db.get("properties", {}).keys())
         info["props"] = props[:20]
 
-        # 2) Try a harmless dry-run create with only the Title prop
-        #    Code expects the title prop to be named "Post (snippet)"
         if "Post (snippet)" not in props:
             return {**info, "error": 'Missing required Notion property: "Post (snippet)". Rename your title column to exactly that.'}, 200
 
@@ -519,7 +577,6 @@ def notion_diag():
             parent={"database_id": NOTION_DB_ID},
             properties={"Post (snippet)": {"title": [{"type": "text","text": {"content": "[diag] connectivity test"}}]}}
         )
-        # immediately archive the test page to keep the DB clean
         notion.pages.update(page_id=page["id"], archived=True)
         info["create_ok"] = True
         return info, 200
@@ -587,8 +644,8 @@ def ingest_rss():
 
         # insert
         sql = """
-        INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score, explanations)
-        VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score, :explanations)
+        INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score, explanations, status)
+        VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score, :explanations, :status)
         RETURNING id;
         """
         params = {
@@ -599,12 +656,13 @@ def ingest_rss():
             "intent": label,
             "topics": topics_csv,
             "fit_score": fit_val,
-            "explanations": explain
+            "explanations": explain,
+            "status": "new"
         }
         with engine.begin() as conn:
             new_id = conn.execute(text(sql), params).scalar()
 
-        # Notion sync for each entry (without auto-draft unless enabled)
+        # Notion sync (respect NOTION_AUTODRAFT)
         auto_draft = (label == "BUY_READY" and fit_val >= 0.60) or (os.getenv("NOTION_AUTODRAFT","0") == "1")
         draft_text = None
         if auto_draft:
@@ -614,6 +672,18 @@ def ingest_rss():
                 "topics": topicfit["topics"],
                 "fit_score": fit_val
             })
+            with engine.begin() as conn:
+                conn.execute(
+                    text("UPDATE leads SET reply_text=:r WHERE id=:i"),
+                    {"r": draft_text, "i": new_id}
+                )
+
+        draft_link = url_for_service(request, f"/notion/fill-draft?id={new_id}&force=1}")
+        # (fix accidental brace if any)
+        if draft_link.endswith("}"):
+            draft_link = draft_link[:-1]
+        send_link  = url_for_service(request, f"/send?id={new_id}")
+
         lead_for_notion = {
             "id": new_id,
             "post_text": text_body,
@@ -621,7 +691,8 @@ def ingest_rss():
             "fit_score": fit_val,
             "topics": topicfit["topics"],
             "source_link": url,
-            "draft_link": f'https://asher-agent.onrender.com/reply-draft?id={new_id}',
+            "draft_link": draft_link,
+            "send_link": send_link,
         }
         try:
             page_id = create_notion_row(lead_for_notion, draft_text=draft_text)
@@ -671,6 +742,129 @@ def reply_draft():
         "fit_score": float(row["fit_score"] or 0.0)
     })
     return {"ok": True, "id": int(row["id"]), "reply": reply}, 200
+
+# -----------------------------
+# NEW: Notion fill-draft (clickable from Notion)
+# -----------------------------
+@app.get("/notion/fill-draft")
+def notion_fill_draft():
+    """
+    GET /notion/fill-draft?id=LEAD_ID&force=1
+    Generates (or reuses) a draft reply, stores it in DB, writes 'Draft' in Notion,
+    sets Status='Drafted', and ensures action links exist.
+    """
+    lead_id = request.args.get("id", type=int)
+    force = request.args.get("force", default=0, type=int)
+
+    if not lead_id:
+        return jsonify({"ok": False, "error": "Missing id"}), 400
+
+    # fetch the lead with reply_text + notion_page_id
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT id, platform, source_url, author, post_text, intent, topics, fit_score,
+                   explanations, notion_page_id, created_at, reply_text
+            FROM leads
+            WHERE id = :id
+        """), {"id": lead_id}).mappings().first()
+
+    if not row:
+        return jsonify({"ok": False, "error": "Lead not found"}), 404
+
+    # Decide whether to reuse or regenerate
+    draft = row["reply_text"]
+    regenerated = False
+    if force or not (draft and draft.strip()):
+        topics_list = [t.strip() for t in (row["topics"] or "").split(",")] if row["topics"] else []
+        draft = generate_reply_text({
+            "post_text": row["post_text"],
+            "intent": row["intent"],
+            "topics": topics_list,
+            "fit_score": float(row["fit_score"] or 0.0)
+        })
+        regenerated = True
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE leads SET reply_text=:r WHERE id=:i"), {"r": draft, "i": row["id"]})
+
+    page_id = row["notion_page_id"]
+    if not page_id:
+        return jsonify({"ok": False, "error": "No linked Notion page_id for this lead"}), 400
+
+    # Write to Notion: Draft, Status, ensure Draft/Send links
+    draft_link = url_for_service(request, f"/notion/fill-draft?id={row['id']}&force=1")
+    send_link  = url_for_service(request, f"/send?id={row['id']}")
+
+    props = {
+        "Draft":       notion_prop("rich_text", draft),
+        "Status":      notion_prop("select", {"name": "Drafted"}),
+        "Draft Link":  notion_prop("url", draft_link),
+        "Send Link":   notion_prop("url", send_link),
+    }
+    try:
+        update_notion_fields(page_id, props)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Notion update failed: {e}"}), 500
+
+    return jsonify({
+        "ok": True,
+        "lead_id": int(row["id"]),
+        "regenerated": regenerated,
+        "notion_page_id": page_id,
+        "draft_preview": draft[:240]
+    }), 200
+
+# -----------------------------
+# NEW: Send shim (no external posting yet)
+# -----------------------------
+@app.get("/send")
+def send_route():
+    """
+    GET /send?id=LEAD_ID
+    For now, this marks the lead as 'posted', stamps sent_at, and mirrors Status in Notion.
+    Replace the no-op section with platform adapters to truly publish.
+    """
+    lead_id = request.args.get("id", type=int)
+    if not lead_id:
+        return jsonify({"ok": False, "error": "Missing id"}), 400
+
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT id, platform, source_url, author, post_text, intent, topics, fit_score,
+                   explanations, notion_page_id, created_at, reply_text
+            FROM leads
+            WHERE id = :id
+        """), {"id": lead_id}).mappings().first()
+
+    if not row:
+        return jsonify({"ok": False, "error": "Lead not found"}), 404
+
+    if not row["reply_text"] or not row["reply_text"].strip():
+        return jsonify({"ok": False, "error": "No draft exists. Use /notion/fill-draft first."}), 400
+
+    # Placeholder: Do NOT actually post externally yet.
+    sent_at = datetime.now(timezone.utc)
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE leads SET status='posted', sent_at=:t WHERE id=:i"),
+            {"t": sent_at, "i": row["id"]}
+        )
+
+    if row["notion_page_id"]:
+        try:
+            update_notion_fields(row["notion_page_id"], {
+                "Status": notion_prop("select", {"name": "Posted"}),
+                # Add a 'Permalink' URL property here once real adapters return it.
+            })
+        except Exception:
+            pass
+
+    return jsonify({
+        "ok": True,
+        "lead_id": int(row["id"]),
+        "platform": row["platform"],
+        "source_url": row["source_url"],
+        "sent_at": sent_at.isoformat()
+    }), 200
 
 # -----------------------------
 # Root

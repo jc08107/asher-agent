@@ -2,6 +2,7 @@ import os
 import json
 import re
 import feedparser
+from datetime import datetime
 from flask import Flask, jsonify, request
 from sqlalchemy import create_engine, text
 from openai import OpenAI
@@ -14,7 +15,7 @@ client = OpenAI()
 app = Flask(__name__)
 
 # -----------------------------
-# Book Profiles (start with ASHER; add JINGLED later)
+# Book Profiles (ASHER active now; add JINGLED when ready)
 # -----------------------------
 BOOKS = {
     "ASHER": {
@@ -33,11 +34,11 @@ BOOKS = {
         "content_notes": ["romance (queer), peril, political stakes"],
         "sample_link": "https://a.co/d/4GKJm8Q"  # TODO: replace with your real link
     },
-    # "JINGLED": {...}  # add later when you're ready
+    # "JINGLED": { ... }  # add later when you're ready
 }
 
 # Set which book is currently active for matching & reply-drafts
-ACTIVE_BOOK = "ASHER"  # change later to "JINGLED" if you want to switch
+ACTIVE_BOOK = os.getenv("ACTIVE_BOOK", "ASHER").upper()
 
 # -----------------------------
 # Database URL (psycopg v3 + SSL for Render)
@@ -70,7 +71,7 @@ def health():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 # -----------------------------
-# Init (creates base table)
+# Init (creates base table incl. explanations)
 # -----------------------------
 @app.post("/init")
 def init():
@@ -88,6 +89,7 @@ def init():
         intent TEXT,                      -- 'BUY_READY', 'CURIOUS', etc.
         topics TEXT,                      -- comma-separated tags (optional)
         fit_score DOUBLE PRECISION,       -- 0.0 - 1.0 (optional)
+        explanations TEXT,                -- why the fit was scored that way (debug)
         created_at TIMESTAMPTZ DEFAULT NOW()
     );
     """
@@ -106,6 +108,16 @@ def migrate_add_topics_fit():
         conn.execute(text(ddl1))
         conn.execute(text(ddl2))
     return {"ok": True, "message": "Columns topics, fit_score ready"}, 200
+
+# -----------------------------
+# Migration (adds explanations)
+# -----------------------------
+@app.post("/migrate/add-explanations")
+def migrate_add_explanations():
+    ddl = "ALTER TABLE leads ADD COLUMN IF NOT EXISTS explanations TEXT;"
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
+    return {"ok": True, "message": "Column explanations ready"}, 200
 
 # -----------------------------
 # Insert test row
@@ -179,55 +191,119 @@ def classify_intent(text_body: str) -> dict:
     return {"label": label, "confidence": conf}
 
 # -----------------------------
-# Topic extraction + Fit scoring against ACTIVE_BOOK
+# Enhanced Topic Taxonomy + Few-shot anchors (for stability)
+# -----------------------------
+TOPIC_TAXONOMY = {
+    "platform-intent": ["buying-now","looking-for-recs","TBR-add","library-hold","DNF","author-follow","cover-love"],
+    "age-shelf": ["YA","adult","new-adult","middle-grade"],
+    "genre": ["fantasy","sci-fi","romance","thriller","mystery","speculative","historical","LGBTQ+"],
+    "tropes": ["enemies-to-lovers","forbidden-love","royal-romance","found-family","political-intrigue",
+               "slow-burn","queer-protagonist","family-holiday-drama","corporate-conspiracy","media-critique"],
+    "vibe": ["cozy","angsty","satirical","smart","character-driven","high-stakes"]
+}
+
+FEW_SHOT = [
+    {
+      "post": "Looking for queer YA fantasy with politics and a royal romance—bonus if it's enemies to lovers.",
+      "topics": ["YA","fantasy","romance","queer-protagonist","royal-romance","enemies-to-lovers","political-intrigue","looking-for-recs"],
+      "fit_asher": 0.92, "why_asher": "Matches YA, queer royal romance, enemies-to-lovers, political intrigue.",
+      "fit_jingled": 0.12, "why_jingled": "Different genre/audience."
+    },
+    {
+      "post": "Any biting holiday satire about families melting down over politics? Dark humor welcome.",
+      "topics": ["adult","satirical","family-holiday-drama","political-intrigue","media-critique","looking-for-recs"],
+      "fit_asher": 0.10, "why_asher": "Not YA fantasy.",
+      "fit_jingled": 0.88, "why_jingled": "Adult satire exactly on political/holiday divide."
+    },
+    {
+      "post": "Just finished Red, White & Royal Blue. Need more royal romance with queer leads!",
+      "topics": ["adult","romance","royal-romance","queer-protagonist","TBR-add"],
+      "fit_asher": 0.65, "why_asher": "Queer royal romance overlap though YA fantasy vs rom-com.",
+      "fit_jingled": 0.15, "why_jingled": "Not satire."
+    }
+]
+
+def _kebab(s: str) -> str:
+    return re.sub(r"[^a-z0-9\-]+", "", re.sub(r"\s+", "-", s.strip().lower()))[:60]
+
+def _build_analysis_prompt(post_text: str, book_profile: dict) -> str:
+    return f"""You are a meticulous book-match analyst.
+Return JSON with fields: topics (array, 3-10 concise kebab-case tags), fit_score (0..1), and explanations (string).
+Be decisive; avoid generic tags.
+
+Taxonomy (examples): {json.dumps(TOPIC_TAXONOMY)}
+
+Active book:
+Title: {book_profile['title']}
+Audience: {book_profile['audience']}
+Genres: {', '.join(book_profile['genres'])}
+Tropes: {', '.join(book_profile['tropes'])}
+Themes: {', '.join(book_profile['themes'])}
+Comps: {', '.join(book_profile['comps'])}
+Pitch: {book_profile['short_pitch']}
+
+Guidelines:
+- Topics: pick 5–9, draw from taxonomy when relevant, plus any sharply relevant extras you invent.
+- Fit scoring rubric (anchor these):
+  0.90–1.00: direct, obvious match (multiple overlaps on audience/genre/tropes).
+  0.70–0.89: strong partial match (2–3 major overlaps; minor mismatches ok).
+  0.40–0.69: tangential (some overlap but not core).
+  0.10–0.39: weak relevance.
+  0.00–0.09: off-topic.
+- Penalize mismatched audience/age-shelf. Boost for explicit trope & theme alignment.
+- If user is BUYING/looking-now, bias fit slightly upward when content aligns.
+
+Few-shot references:
+{json.dumps(FEW_SHOT, ensure_ascii=False, indent=2)}
+
+Now analyze this post:
+POST: {post_text}
+
+Return ONLY compact JSON.
+"""
+
+# -----------------------------
+# Topic extraction + calibrated Fit scoring against ACTIVE_BOOK
 # -----------------------------
 def analyze_topics_and_fit(text_body: str, book_profile: dict) -> dict:
     """
-    Return {"topics": [...], "fit_score": 0.0} for the active book.
-    Fit score: 0 (no fit) to 1 (strong fit) based on genres, tropes, themes, tone, audience.
+    Return {"topics": [...], "fit_score": 0.0, "explanations": "..."} for the active book.
+    Fit score: 0 (no fit) to 1 (strong fit) based on audience/genre/tropes/themes.
     """
-    profile = (
-        f"Title: {book_profile['title']}\n"
-        f"Audience: {book_profile['audience']}\n"
-        f"Genres: {', '.join(book_profile['genres'])}\n"
-        f"Tropes: {', '.join(book_profile['tropes'])}\n"
-        f"Themes: {', '.join(book_profile['themes'])}\n"
-        f"Tone: {book_profile['tone']}\n"
-        f"Comps: {', '.join(book_profile['comps'])}\n"
-        f"Pitch: {book_profile['short_pitch']}\n"
-    )
-    prompt = f"""
-    You are a book-matching assistant. Given a reader's post and a book profile, do two things:
-    1) Extract 2-6 topical tags from the post (lowercase, hyphenated if multiword).
-    2) Provide a fit_score 0.0-1.0 for how well the post aligns to the book (genres/tropes/themes/tone/audience).
-
-    Return JSON with keys: topics (array of strings), fit_score (float 0-1).
-
-    Book Profile:
-    {profile}
-
-    Reader Post:
-    {text_body}
-    """
+    prompt = _build_analysis_prompt(text_body, book_profile)
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role":"system","content":"You return precise, compact JSON only."},
-            {"role":"user","content": prompt}
+            {"role": "system", "content": "You produce compact JSON only."},
+            {"role": "user", "content": prompt}
         ],
-        temperature=0.1,
+        temperature=0.2
     )
     raw = resp.choices[0].message.content.strip()
+    # Parse + clamp
     try:
         data = json.loads(raw)
-        topics = data.get("topics") or []
-        fit = float(data.get("fit_score", 0.0))
     except Exception:
-        topics, fit = [], 0.0
-    return {"topics": topics, "fit_score": fit}
+        data = {"topics": ["unsure"], "fit_score": 0.0, "explanations": "parse_error", "raw": raw}
+
+    try:
+        score = float(data.get("fit_score", 0))
+    except Exception:
+        score = 0.0
+    score = max(0.0, min(1.0, score))
+
+    topics = data.get("topics") or []
+    topics = [_kebab(t) for t in topics if isinstance(t, str)]
+    topics = [t for t in topics if t][:10]  # 10 max
+
+    return {
+        "topics": topics,
+        "fit_score": score,
+        "explanations": data.get("explanations", "")
+    }
 
 # -----------------------------
-# classify-insert: label + topics + fit, then insert
+# classify-insert: label + topics + fit (+ explanations), then insert
 # -----------------------------
 @app.post("/classify-insert")
 def classify_insert():
@@ -245,14 +321,15 @@ def classify_insert():
     label = result["label"]
 
     # topics + fit (against active book profile)
-    book = BOOKS[ACTIVE_BOOK]
+    book = BOOKS.get(ACTIVE_BOOK, BOOKS["ASHER"])
     topicfit = analyze_topics_and_fit(text_body, book)
     topics_csv = ", ".join(topicfit["topics"]) if topicfit["topics"] else None
     fit_val = float(topicfit["fit_score"])
+    explain = topicfit.get("explanations") or None
 
     sql = """
-    INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score)
-    VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score)
+    INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score, explanations)
+    VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score, :explanations)
     RETURNING id;
     """
     params = {
@@ -263,6 +340,7 @@ def classify_insert():
         "intent": label,
         "topics": topics_csv,
         "fit_score": fit_val,
+        "explanations": explain
     }
     with engine.begin() as conn:
         new_id = conn.execute(text(sql), params).scalar()
@@ -271,8 +349,26 @@ def classify_insert():
         "inserted_id": new_id,
         "label": label,
         "topics": topicfit["topics"],
-        "fit_score": fit_val
+        "fit_score": fit_val,
+        "explanations": explain
     }, 200
+
+# -----------------------------
+# Optional: quick analyzer endpoint for ad-hoc tests
+# -----------------------------
+@app.post("/analyze")
+def analyze_endpoint():
+    """
+    POST JSON: { "post_text": "..." }
+    Returns analyzer output without inserting into DB.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    post_text = (body.get("post_text") or "").strip()
+    if not post_text:
+        return {"ok": False, "error": "Provide 'post_text' in JSON"}, 400
+    book = BOOKS.get(ACTIVE_BOOK, BOOKS["ASHER"])
+    result = analyze_topics_and_fit(post_text, book)
+    return jsonify({"ok": True, **result}), 200
 
 # -----------------------------
 # ingest/rss: pull, label + topics + fit for each entry
@@ -293,7 +389,7 @@ def ingest_rss():
         return {"ok": False, "feed": feed_url, "inserted": 0, "error": "No entries found"}, 200
 
     inserted = 0
-    book = BOOKS[ACTIVE_BOOK]
+    book = BOOKS.get(ACTIVE_BOOK, BOOKS["ASHER"])
     for e in feed.entries[:20]:  # limit for now
         url = getattr(e, "link", "n/a")
         author = getattr(e, "author", "n/a")
@@ -309,11 +405,12 @@ def ingest_rss():
         topicfit = analyze_topics_and_fit(text_body, book)
         topics_csv = ", ".join(topicfit["topics"]) if topicfit["topics"] else None
         fit_val = float(topicfit["fit_score"])
+        explain = topicfit.get("explanations") or None
 
         # insert
         sql = """
-        INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score)
-        VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score)
+        INSERT INTO leads (platform, source_url, author, post_text, intent, topics, fit_score, explanations)
+        VALUES (:platform, :source_url, :author, :post_text, :intent, :topics, :fit_score, :explanations)
         """
         params = {
             "platform": "rss",
@@ -323,6 +420,7 @@ def ingest_rss():
             "intent": label,
             "topics": topics_csv,
             "fit_score": fit_val,
+            "explanations": explain
         }
         with engine.begin() as conn:
             conn.execute(text(sql), params)
@@ -356,7 +454,7 @@ def reply_draft():
     if not row:
         return {"ok": False, "error": f"Lead {lead_id} not found"}, 404
 
-    book = BOOKS[ACTIVE_BOOK]
+    book = BOOKS.get(ACTIVE_BOOK, BOOKS["ASHER"])
     profile_note = (
         f"You're replying as the author of '{book['title']}'. "
         f"Audience: {book['audience']}. Genres: {', '.join(book['genres'])}. "

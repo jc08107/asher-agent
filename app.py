@@ -51,10 +51,21 @@ def update_notion_fields(page_id: str, props: dict):
     notion.pages.update(page_id=page_id, properties=props)
 
 def url_for_service(req, path: str) -> str:
-    base = req.host_url  # includes trailing "/"
+    """
+    Prefer an explicit base (SERVICE_BASE_URL) so links are correct
+    even when routes are invoked via internal/test contexts.
+    """
+    base = os.getenv("SERVICE_BASE_URL")
+    if not base:
+        base = getattr(req, "host_url", "") or ""
+    if not base:
+        base = "http://localhost/"  # last resort
+    if not base.endswith("/"):
+        base += "/"
     if path.startswith("/"):
         path = path[1:]
     return base + path
+
 
 def create_notion_row(lead: dict, draft_text: str | None = None) -> str | None:
     if not notion:
@@ -532,6 +543,44 @@ def _fuzzy_match(text: str, pos_groups, neg_terms) -> bool:
         if any(term in t for term in group):
             return True
     return False
+
+@app.route("/notion/backfill-links", methods=["POST","GET"])
+def notion_backfill_links():
+    """
+    Rewrites Draft Link / Send Link in Notion using SERVICE_BASE_URL.
+    Optional query 'id' to update just one lead: /notion/backfill-links?id=22
+    """
+    lead_id = request.args.get("id", type=int)
+    q = "SELECT id, notion_page_id FROM leads WHERE notion_page_id IS NOT NULL"
+    params = {}
+    if lead_id:
+        q += " AND id = :id"
+        params["id"] = lead_id
+
+    updated = 0
+    base = os.getenv("SERVICE_BASE_URL") or (request.host_url if hasattr(request, "host_url") else "")
+    if not base:
+        return {"ok": False, "error": "SERVICE_BASE_URL not set"}, 400
+    if not base.endswith("/"):
+        base += "/"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(q), params).mappings().all()
+
+    for r in rows:
+        lid = int(r["id"])
+        pid = r["notion_page_id"]
+        props = {
+            "Draft Link": notion_prop("url", f"{base}notion/fill-draft?id={lid}&force=1"),
+            "Send Link":  notion_prop("url", f"{base}send?id={lid}"),
+        }
+        try:
+            update_notion_fields(pid, props)
+            updated += 1
+        except Exception:
+            pass
+
+    return {"ok": True, "updated": updated}, 200
 
 @app.route("/ingest/reddit_rss", methods=["GET", "POST"])
 def ingest_reddit_rss():

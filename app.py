@@ -308,7 +308,7 @@ def generate_reply_text(row_like: dict) -> str:
     profile_note = (
         f"You're replying as the author of '{book['title']}'. "
         f"Audience: {book['audience']}. Genres: {', '.join(book['genres'])}. "
-        f"Tropes: {', '.join(book['tropes'])}. Tone: {book['tone']}. "
+        f"Tropes: {book['tropes']}. Tone: {book['tone']}. "
         f"Pitch: {book['short_pitch']}. Sample link: {book['sample_link']}"
     )
     topics_display = row_like.get("topics") or "n/a"
@@ -337,7 +337,7 @@ Fit score (0-1): {row_like.get('fit_score',0.0)}
     return resp.choices[0].message.content.strip()
 
 # -----------------------------
-# Auto-draft policy (ENV-driven)  ← NEW
+# Auto-draft policy (ENV-driven)
 # -----------------------------
 def _should_autodraft(label: str, fit: float) -> bool:
     """
@@ -346,7 +346,6 @@ def _should_autodraft(label: str, fit: float) -> bool:
       - otherwise use AUTODRAFT_MIN_FIT (default 0.60) and AUTODRAFT_INTENTS (default BUY_READY)
         e.g., AUTODRAFT_INTENTS=BUY_READY,CURIOUS
     """
-    # Master override: draft everything
     if os.getenv("NOTION_AUTODRAFT", "0") == "1":
         return True
     try:
@@ -393,7 +392,7 @@ def classify_insert():
     with engine.begin() as conn:
         new_id = conn.execute(text(sql), params).scalar()
 
-    # --- UPDATED: env-driven auto-draft policy
+    # env-driven auto-draft policy
     auto_draft = _should_autodraft(label, fit_val)
     draft_text = None
     if auto_draft:
@@ -611,7 +610,7 @@ def ingest_reddit_rss():
             with engine.begin() as conn:
                 new_id = conn.execute(text(sql), params).scalar()
 
-            # --- UPDATED: env-driven auto-draft policy (+ overrides)
+            # env-driven auto-draft (+ overrides)
             auto_default = _should_autodraft(label, fit_val)
             auto_draft = (False if force_off else True if force_on else auto_default)
             draft_text = None
@@ -656,7 +655,7 @@ def ingest_reddit_rss():
     return {"ok": True, "query": q, "subs": subs_list, "per_sub": per_sub_counts, "total_inserted": total, "samples": inserted_ids[:10]}, 200
 
 # -----------------------------
-# Presets + runner (unchanged semantics)
+# Presets + runner
 # -----------------------------
 PRESETS = {
     "asher-hot": {
@@ -852,7 +851,7 @@ def ingest_reddit_comments():
                 with engine.begin() as conn:
                     new_id = conn.execute(text(sql), params).scalar()
 
-                # --- UPDATED: env-driven auto-draft policy (+ overrides)
+                # env-driven auto-draft (+ overrides)
                 auto_default = _should_autodraft(label, fit_val)
                 auto_draft = (False if force_off else True if force_on else auto_default)
                 draft_text = None
@@ -1063,7 +1062,7 @@ def send_route():
     return jsonify({"ok": True, "lead_id": int(row["id"]), "platform": platform, "source_url": source_url,
                     "permalink": permalink, "sent_at": sent_at.isoformat(), "live": _is_live()}), 200
 
-# NEW: auto-post drafted replies, filtered and capped
+# Batch auto-post (filter + cap)
 @app.get("/send/auto")
 def send_auto():
     """
@@ -1097,6 +1096,43 @@ def send_auto():
             resp, status = send_route()
         results.append({"id": lid, "status": status, "resp": resp})
     return {"ok": True, "attempted": len(ids), "results": results, "live": _is_live()}, 200
+
+# NEW: one-at-a-time auto-poster (every 30 minutes)
+@app.get("/send/auto30")
+def send_auto30():
+    """
+    Post exactly one eligible draft per run.
+    Prefers BUY_READY, then CURIOUS.
+    Query params:
+      min_fit (float) default 0.6
+      intents (comma list) default "BUY_READY,CURIOUS"
+    """
+    min_fit = float(request.args.get("min_fit", 0.6))
+    intents_order = [s.strip().upper() for s in (request.args.get("intents") or "BUY_READY,CURIOUS").split(",") if s.strip()]
+
+    base_q = """
+    SELECT id
+    FROM leads
+    WHERE reply_text IS NOT NULL
+      AND (status IS NULL OR status ILIKE 'drafted%%' OR status ILIKE 'new%%')
+      AND (fit_score IS NULL OR fit_score >= :min_fit)
+      AND intent = :intent
+    ORDER BY created_at ASC
+    LIMIT 1;
+    """
+
+    for intent in intents_order:
+        with engine.connect() as conn:
+            row = conn.execute(text(base_q), {"min_fit": min_fit, "intent": intent}).first()
+        if not row:
+            continue
+
+        lid = int(row[0])
+        with app.test_request_context(f"/send?id={lid}", method="GET"):
+            resp, status = send_route()
+        return {"ok": (status == 200), "picked": lid, "status": status, "resp": resp}, status
+
+    return {"ok": True, "picked": None, "message": "No eligible drafts found."}, 200
 
 # -----------------------------
 # Root

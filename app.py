@@ -99,11 +99,28 @@ BOOKS = {
         "tropes": ["enemies to lovers", "forbidden romance", "political intrigue", "secret technology", "found family"],
         "themes": ["agency & partnership", "truth vs myth", "social change", "industrialization vs tradition"],
         "tone": "adventurous, heartfelt, thoughtful, witty",
-        "comps": ["The Goblin Emperor", "Carry On", "Red, White & Royal Blue (vibes)", "Strange the Dreamer"],
+        "comps": [
+            "The Goblin Emperor",
+            "Carry On",
+            "Red, White & Royal Blue (vibes)",
+            "Strange the Dreamer"
+        ],
         "short_pitch": (
-            "A commoner with a curious mind falls for a prince in a far-future medieval world; "
-            "together they must recover a mythic sword, confront a hidden empire, and decide whether the legend "
-            "that unites their people is worth preserving."
+            "Asher and the Prince (78k words) is a YA novel—a fantasy/sci-fi/LGBTQ adventure with an 'enemies to lovers' "
+            "romance, set in a medieval-style kingdom in the distant future. The story explores society’s relationship "
+            "with technology and the moral weight of progress: can innovation be managed responsibly, or does it always "
+            "tempt humanity toward ruin, like a drunkard’s promise of 'just this one time'?\n\n"
+            "Asher Snow, a quick-witted commoner, loses his savings in a tavern game only to save a witch’s life moments "
+            "later. Granted a wish, he uses it to make the prince fall in love with him—not out of romance, but as a ruse "
+            "to spare his kingdom from war. Yet deception runs both ways: the witch has no true powers, and she manipulates "
+            "the prince with tales of a fabled sword said to end all wars.\n\n"
+            "Bound by prophecy and forbidden affection, Asher and the prince embark on a perilous quest to recover the past "
+            "and save the future. Along the way, Asher discovers an ancient oracle capable of transmitting knowledge from a "
+            "long-lost technological age. The deeper he delves, the clearer his dilemma becomes: can he revive technology to "
+            "benefit society without rekindling the destruction that once brought civilization to its knees?\n\n"
+            "Amid treacherous enchantments and political upheaval, Asher and the prince must face both their inner demons "
+            "and a world unwilling to change. Their journey becomes not just one of survival, but of love, sacrifice, and "
+            "the enduring struggle to reconcile heart with reason."
         ),
         "content_notes": ["romance (queer), peril, political stakes"],
         "sample_link": "https://a.co/d/4GKJm8Q"

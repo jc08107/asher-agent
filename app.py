@@ -337,6 +337,26 @@ Fit score (0-1): {row_like.get('fit_score',0.0)}
     return resp.choices[0].message.content.strip()
 
 # -----------------------------
+# Auto-draft policy (ENV-driven)  ← NEW
+# -----------------------------
+def _should_autodraft(label: str, fit: float) -> bool:
+    """
+    Returns True if the lead should auto-draft based on env:
+      - NOTION_AUTODRAFT=1 overrides everything (draft all)
+      - otherwise use AUTODRAFT_MIN_FIT (default 0.60) and AUTODRAFT_INTENTS (default BUY_READY)
+        e.g., AUTODRAFT_INTENTS=BUY_READY,CURIOUS
+    """
+    # Master override: draft everything
+    if os.getenv("NOTION_AUTODRAFT", "0") == "1":
+        return True
+    try:
+        min_fit = float(os.getenv("AUTODRAFT_MIN_FIT", "0.60"))
+    except Exception:
+        min_fit = 0.60
+    intents = [s.strip().upper() for s in os.getenv("AUTODRAFT_INTENTS", "BUY_READY").split(",") if s.strip()]
+    return (label or "").upper() in intents and (fit or 0.0) >= min_fit
+
+# -----------------------------
 # classify-insert
 # -----------------------------
 @app.post("/classify-insert")
@@ -373,7 +393,8 @@ def classify_insert():
     with engine.begin() as conn:
         new_id = conn.execute(text(sql), params).scalar()
 
-    auto_draft = (label == "BUY_READY" and fit_val >= 0.60) or (os.getenv("NOTION_AUTODRAFT","0") == "1")
+    # --- UPDATED: env-driven auto-draft policy
+    auto_draft = _should_autodraft(label, fit_val)
     draft_text = None
     if auto_draft:
         draft_text = generate_reply_text({
@@ -590,8 +611,8 @@ def ingest_reddit_rss():
             with engine.begin() as conn:
                 new_id = conn.execute(text(sql), params).scalar()
 
-            # auto-draft
-            auto_default = (label == "BUY_READY" and fit_val >= 0.60) or (os.getenv("NOTION_AUTODRAFT","0") == "1")
+            # --- UPDATED: env-driven auto-draft policy (+ overrides)
+            auto_default = _should_autodraft(label, fit_val)
             auto_draft = (False if force_off else True if force_on else auto_default)
             draft_text = None
             if auto_draft:
@@ -822,8 +843,8 @@ def ingest_reddit_comments():
                 with engine.begin() as conn:
                     new_id = conn.execute(text(sql), params).scalar()
 
-                # auto-draft
-                auto_default = (label == "BUY_READY" and fit_val >= 0.60) or (os.getenv("NOTION_AUTODRAFT","0") == "1")
+                # --- UPDATED: env-driven auto-draft policy (+ overrides)
+                auto_default = _should_autodraft(label, fit_val)
                 auto_draft = (False if force_off else True if force_on else auto_default)
                 draft_text = None
                 if auto_draft:

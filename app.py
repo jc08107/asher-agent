@@ -946,27 +946,51 @@ def _send_allowed(platform: str) -> bool:
     return platform.lower() in allow
 
 def _reddit_reply(source_url: str, reply_text: str) -> dict:
-    if not _is_live(): return {"permalink": None, "id": None}
+    """
+    Reply in-place on Reddit under source_url (submission or comment).
+    Returns {"permalink": "...", "id": "..."}.
+    Only posts if SEND_LIVE=1.
+    """
+    if not _is_live():
+        return {"permalink": None, "id": None}
+
     try:
         import praw
     except Exception as e:
         raise RuntimeError("praw is not installed. Add 'praw==7.8.1' to requirements.txt.") from e
+
     reddit = _reddit_client()
+
+    # Try to parse submission id and optional comment id from canonical URLs
+    # e.g., /comments/<sub_id>/<slug>/<comment_id>/
     m = re.search(r"/comments/([a-z0-9]+)/[^/]+(?:/([a-z0-9]+))?", source_url, re.I)
-    if not m:
-        # Try to let praw detect; reply to submission
-        try:
-            thing = reddit.comment(url=source_url); posted = thing.reply(reply_text)
-            return {"permalink": f"https://www.reddit.com{posted.permalink}", "id": posted.id}
-        except Exception:
-            thing = reddit.submission(url=source_url); posted = thing.reply(reply_text)
-            return {"permalink": f"https://www.reddit.com{posted.permalink}", "id": posted.id}
-    sub_id, comment_id = m.group(1), m.group(2)
-    if comment_id:
-        parent = reddit.comment(comment_id); posted = parent.reply(reply_text)
-    else:
-        parent = reddit.submission(submission_id=sub_id); posted = parent.reply(reply_text)
-    return {"permalink": f"https://www.reddit.com{posted.permalink}", "id": posted.id}
+
+    try:
+        if m:
+            sub_id, comment_id = m.group(1), m.group(2)
+            if comment_id:
+                # reply to a specific comment
+                parent = reddit.comment(id=comment_id)
+                posted = parent.reply(reply_text)
+            else:
+                # reply top-level to a submission
+                parent = reddit.submission(id=sub_id)
+                posted = parent.reply(reply_text)
+        else:
+            # Fallback: let PRAW infer from the URL
+            try:
+                parent = reddit.comment(url=source_url)
+                posted = parent.reply(reply_text)
+            except Exception:
+                parent = reddit.submission(url=source_url)
+                posted = parent.reply(reply_text)
+
+        return {"permalink": f"https://www.reddit.com{posted.permalink}", "id": posted.id}
+
+    except Exception as e:
+        # Bubble up to /send so you see a clear error message
+        raise RuntimeError(str(e))
+
 
 @app.get("/send")
 def send_route():

@@ -739,14 +739,23 @@ def _require_praw():
         raise RuntimeError("praw is not installed. Add 'praw==7.8.1' to requirements.txt.") from e
 
 def _reddit_client():
-    import praw
+    import praw, os
+    cid   = os.getenv("REDDIT_CLIENT_ID")
+    csec  = os.getenv("REDDIT_CLIENT_SECRET")
+    ua    = os.getenv("REDDIT_USER_AGENT", "asher-agent/1.0")
+    rtok  = os.getenv("REDDIT_REFRESH_TOKEN")
+
+    if not (cid and csec and rtok):
+        # Be explicit so we never fall back to password auth on a web app
+        raise RuntimeError("Missing Reddit OAuth envs (need CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN).")
+
     return praw.Reddit(
-        client_id=os.getenv("REDDIT_CLIENT_ID"),
-        client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
-        username=os.getenv("REDDIT_USERNAME"),
-        password=os.getenv("REDDIT_PASSWORD"),
-        user_agent=os.getenv("REDDIT_USER_AGENT", "asher-agent/1.0"),
+        client_id=cid,
+        client_secret=csec,
+        refresh_token=rtok,
+        user_agent=ua,
     )
+
 
 @app.get("/ingest/reddit_comments")
 def ingest_reddit_comments():

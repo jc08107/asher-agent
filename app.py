@@ -310,85 +310,67 @@ def _strip_urls(text: str) -> str:
 
 def generate_reply_text(row_like: dict) -> str:
     """
-    Softer, community-first reply builder:
-    - Be contextually helpful to the OP/commenter.
-    - Do NOT include any links or explicit calls to buy.
-    - Mention "Asher and the Prince" only if it is contextually appropriate AND
-      at least one other comparable book is also recommended (never as the sole rec).
-    - Never state or imply you are the author.
-    - Keep it short (2–4 sentences); neutral, collegial Reddit tone.
-    - If the post is a request for recommendations, offer 2–3 options that fit;
-      only include "Asher and the Prince" as one among several, and only if relevant.
-    - If the post is a discussion (not a rec request), contribute a thought, insight,
-      or question that advances the conversation; avoid any rec list unless clearly invited.
-    - Avoid emojis and markdown flair; no sales language; no external links.
+    Community-first reply:
+    - No links, no self-promo, no author disclosure.
+    - If the OP/comment clearly mentions a book, add ONE helpful, factual note about that book
+      (only if reasonably sure; otherwise ask a brief, non-pushy clarifying question).
+    - Mention 'Asher and the Prince' ONLY if it truly fits the request AND at least one other
+      comparable title is also suggested; never as the sole recommendation; never with a link.
+    - 2–4 sentences, single paragraph, collegial tone appropriate for Reddit.
     """
-
     book = BOOKS.get(ACTIVE_BOOK, BOOKS.get("ASHER", {}))
-
-    # Build a compact profile summary purely for topical alignment (no link!)
     profile_summary = (
-        f"Reference book (for possible inclusion ONLY if appropriate among several): "
+        f"Reference (only if contextually appropriate among several titles): "
         f"'{book.get('title','Asher and the Prince')}', "
         f"audience {book.get('audience','YA')}, genres {', '.join(book.get('genres', []))}, "
         f"tropes {', '.join(book.get('tropes', []))}, themes {', '.join(book.get('themes', []))}."
     )
 
-    # Prepare context from the row
     post_text = (row_like.get("post_text") or "").strip()
     intent     = (row_like.get("intent") or "CURIOUS").upper()
     topics     = row_like.get("topics") or []
-    if isinstance(topics, list):
-        topics_display = ", ".join(topics[:10])
-    else:
-        topics_display = str(topics)
+    topics_display = ", ".join(topics[:10]) if isinstance(topics, list) else str(topics)
 
-    # Prompt — community-first, no links, no self-identification
     prompt = f"""
-You are composing a SHORT (2–4 sentences) Reddit reply that is useful, neutral, and community-minded.
-Goal: thoughtfully contribute to the discussion. Do NOT be sales-y. Do NOT include any links.
-Do NOT disclose authorship. Do NOT ask for upvotes or DMs. Avoid emojis and heavy formatting.
+You write SHORT (2–4 sentence) Reddit replies that are helpful, neutral, and anti-promotional.
 
-Context:
-- Original text you are replying to (post or comment):
-  {post_text}
+Context the user wrote (post or comment):
+{post_text}
 
 Known metadata:
-- User intent label: {intent}
+- Labeled intent: {intent}
 - Extracted topics: {topics_display}
 - {profile_summary}
 
 Rules:
-1) If the user is asking for book recommendations, suggest 2–3 titles that genuinely fit.
-   If, and only if, '{book.get('title','Asher and the Prince')}' is contextually appropriate,
-   include it as ONE item among at least TWO recommendations (never the only one), without links.
-   Present the titles naturally, e.g., "You might enjoy X, Y, and Asher and the Prince for its [reason]."
-2) If the user is NOT explicitly asking for recs, write a brief, thoughtful comment that adds insight,
-   asks a clarifying question, or shares a relevant detail. Avoid offering recs unless clearly invited.
-3) NEVER include URLs or refer to "my book", "my novel", or that you are the author.
-4) Keep tone collegial, helpful, and non-promotional—sounds like a fellow reader.
-5) One paragraph only (line-wrapped is fine), 2–4 sentences max.
-
-Now write the reply.
+1) If the user clearly asked for recommendations, suggest 2–3 relevant titles.
+   Include '{book.get('title','Asher and the Prince')}' ONLY if it genuinely fits the user’s request,
+   AND only alongside at least one other title. No links. No exclamation or salesy tone.
+2) If it’s a discussion (not explicitly asking for recs): add a small insight, nuance, or question that advances the conversation.
+3) If the user mentioned a specific book/series/author, add ONE helpful, factual note or observation about that book
+   (publication detail, subgenre, notable theme, or how readers respond). ONLY do so if reasonably confident; if uncertain,
+   pose a light clarifying question instead of guessing.
+4) Never include any URLs. Never refer to “my book/novel” or that you are the author.
+5) One paragraph only; plain tone suitable for Reddit.
+Return just the reply text.
 """
 
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role":"system","content":"You generate helpful, non-promotional, context-first Reddit replies without links."},
+            {"role":"system","content":"You generate context-first Reddit replies without links or self-promotion."},
             {"role":"user","content": prompt}
         ],
         temperature=0.5,
     )
     draft = resp.choices[0].message.content.strip()
-    draft = _strip_urls(draft)  # Just in case the model tries to slip a link in
-
-    # Additional soft guardrails: trim overlong responses and remove obvious self-refs
+    draft = _strip_urls(draft)
+    # Guard against long or self-referential phrasing
     if len(draft.split()) > 100:
         draft = " ".join(draft.split()[:100]).rstrip() + "…"
     draft = re.sub(r"\b(my|our)\s+(book|novel|title)\b", "the book", draft, flags=re.I)
-
     return draft
+
 
 # -----------------------------
 # Auto-draft policy (ENV-driven)
